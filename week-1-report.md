@@ -1,7 +1,8 @@
 ## Builder Track Weekly Report — Week 1
 
-**Name:** Telesphore TUGANNIMANA 
-**Week Ending:** 29-o6-2026
+**Name:** Telesphore TUGANIMANA <br>
+
+**Week Ending:** 29-06-2026
 
 ### Courses Completed
 
@@ -10,7 +11,8 @@
     - I've learnt what's cell and it's structure  which contain capacity,lock script, type and data
     - Script Structure   which look like this
     ```json 
-    Script: {code_hash: HexString
+    Script: {
+        code_hash: HexString
          args: HexString
            hash_type: Uint8, there are three allowed values: {0: "data", 1: "type", 2: "data1"
            } 
@@ -26,7 +28,7 @@
     - Deep dive into `cell_deps`, `witnesses`, `lock` and `type` scripts
     - Understood code locating and execution mechanisms in CKB
 
-- I also dived into rust using  [Rust Book](https://doc.rust-lang.org/book/)
+- I covered some courses on rust  and read [Rust Book](https://doc.rust-lang.org/book/)
 
 ### Key Learnings
 

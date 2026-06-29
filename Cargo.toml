@@ -1,0 +1,8 @@
+[package]
+name = "ckb-rust"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ckb-sdk-rs = "0.110"
+dotenvy = "0.15"

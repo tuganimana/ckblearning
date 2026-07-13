@@ -1,4 +1,3 @@
-use ckb_crypto::secp::{SECP256K1, };
 use ckb_sdk::types::{Address, AddressPayload, NetworkType};
 use rand::Rng;
 use secp256k1::{PublicKey, Secp256k1, SecretKey};
@@ -8,7 +7,7 @@ use secp256k1::{PublicKey, Secp256k1, SecretKey};
 pub struct GeneratedAddress {
     pub address: String,
     pub public_key: String,
-    pub private_key: String, // ⚠️ only for testing, DO NOT expose in production
+    pub private_key: String,// i will remove it on prod
 }
 
 pub fn generate_address() -> GeneratedAddress {
@@ -24,7 +23,7 @@ pub fn generate_address() -> GeneratedAddress {
 
     // 5. Create address
     let address = Address::new(
-        NetworkType::Testnet, // 🔥 use Testnet for dev
+        NetworkType::Testnet, 
         payload,
         true,
     );

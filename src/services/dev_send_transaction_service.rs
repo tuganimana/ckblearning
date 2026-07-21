@@ -1,39 +1,37 @@
 use std::str::FromStr;
 
 use axum::{extract::Json, http::StatusCode};
-use ckb_sdk::{Address, HumanCapacity};
+use ckb_sdk::HumanCapacity;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::config::balance::get_balance;
 use crate::config::create_transaction::{broadcast_transaction, create_transaction};
+use crate::config::wallet_scan::{get_balance_async, GAP_LIMIT, MAX_SCAN};
 
+use super::dev_guard;
 use super::wallet::{derive_wallet, DerivedWallet};
 
-
-const GAP_LIMIT: u32 = 20;
-
-/// Hard safety cap on how many addresses we'll ever derive/check in one request.
-const MAX_SCAN: u32 = 10_000;
 const FEE_BUFFER_SHANNONS: u64 = 100_000_000;
 
-async fn get_balance_async(address: Address) -> Result<u64, (StatusCode, String)> {
-    tokio::task::spawn_blocking(move || get_balance(&address))
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Balance task panicked: {e}"),
-            )
-        })?
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to fetch balance: {e}"),
-            )
-        })
-}
+/// `create_transaction`/`broadcast_transaction` report both client-caused
+/// problems (bad address/amount -- prefixed "Invalid" by convention in that
+/// module) and internal/infra failures (RPC or node issues). We log the full
+/// detail server-side either way, but only echo the message back to the
+/// caller when it's actually about their input; infra failures get a
+/// generic message so we don't leak node/RPC internals in the response.
+fn classify_tx_error(e: anyhow::Error) -> (StatusCode, String) {
+    let message = e.to_string();
+    eprintln!("dev/transaction/send failed: {e:#}");
 
+    if message.starts_with("Invalid") {
+        (StatusCode::BAD_REQUEST, message)
+    } else {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to send the transaction. Please verify your inputs and try again.".to_string(),
+        )
+    }
+}
 
 async fn find_funded_wallet(
     mnemonic: &str,
@@ -83,10 +81,12 @@ async fn find_funded_wallet(
 }
 
 #[derive(Deserialize, ToSchema)]
-pub struct SendTransactionRequest {
-    /// Sender's mnemonic phrase, e.g. produced by /generate-mnemonic.
-    /// Self-custodial: used in-memory only to derive the signing key for
-    /// this single request, never stored server-side.
+pub struct DevSendTransactionRequest {
+    /// Sender's mnemonic phrase. Used in-memory only to derive the signing
+    /// key for this single request, never stored server-side -- but it
+    /// still crosses the network to reach this endpoint, which is exactly
+    /// what the non-custodial flow (/transaction/build + client-side
+    /// signing + /transaction/broadcast) avoids.
     pub mnemonic: String,
     /// Recipient CKB address.
     pub receiver_address: String,
@@ -95,7 +95,7 @@ pub struct SendTransactionRequest {
 }
 
 #[derive(Serialize, ToSchema)]
-pub struct SendTransactionResponse {
+pub struct DevSendTransactionResponse {
     pub tx_hash: String,
     /// Derivation index the funds were actually sent from, found
     /// automatically rather than requiring the caller to specify it.
@@ -105,23 +105,28 @@ pub struct SendTransactionResponse {
     pub amount: String,
 }
 
-/// Builds, signs, and broadcasts a capacity-transfer transaction. The sender
-/// doesn't need to specify which derivation index to spend from: this scans
-/// the mnemonic's addresses (like /balance/wallet) and automatically uses
-/// the first one with enough balance to cover the amount.
+/// **Dev/testing only** -- disabled unless `ALLOW_DEV_KEY_ENDPOINTS=true`.
+/// Builds, signs, and broadcasts a transaction *server-side* given a raw
+/// mnemonic. Use `/transaction/build` + client-side signing +
+/// `/transaction/broadcast` for the real, non-custodial flow: this endpoint
+/// exists only for quick local/devnet iteration when you don't yet have a
+/// client-side signer wired up.
 #[utoipa::path(
     post,
-    path = "/transaction/send",
-    request_body = SendTransactionRequest,
+    path = "/dev/transaction/send",
+    request_body = DevSendTransactionRequest,
     responses(
-        (status = 200, description = "Transaction was built, signed, and broadcast to the CKB node", body = SendTransactionResponse),
+        (status = 200, description = "Transaction was built, signed, and broadcast to the CKB node", body = DevSendTransactionResponse),
         (status = 400, description = "Invalid mnemonic/address/amount, or no address has enough balance"),
+        (status = 403, description = "Disabled: set ALLOW_DEV_KEY_ENDPOINTS=true to enable for local testing"),
         (status = 500, description = "Failed to build or broadcast the transaction")
     )
 )]
-pub async fn send_transaction(
-    Json(payload): Json<SendTransactionRequest>,
-) -> Result<Json<SendTransactionResponse>, (StatusCode, String)> {
+pub async fn send_transaction_dev(
+    Json(payload): Json<DevSendTransactionRequest>,
+) -> Result<Json<DevSendTransactionResponse>, (StatusCode, String)> {
+    dev_guard::require_enabled()?;
+
     let amount_shannons = HumanCapacity::from_str(&payload.amount)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid amount: {e}")))?
         .0;
@@ -143,14 +148,15 @@ pub async fn send_transaction(
     })
     .await
     .map_err(|e| {
+        eprintln!("dev transaction task panicked: {e}");
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Transaction task panicked: {e}"),
+            "Failed to send the transaction. Please try again.".to_string(),
         )
     })?
-    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    .map_err(classify_tx_error)?;
 
-    Ok(Json(SendTransactionResponse {
+    Ok(Json(DevSendTransactionResponse {
         tx_hash: tx_hash.to_string(),
         sender_index: index,
         sender_address: wallet.address.to_string(),

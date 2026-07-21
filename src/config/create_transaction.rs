@@ -8,7 +8,7 @@ use ckb_sdk::{
         DefaultCellCollector, DefaultCellDepResolver, DefaultHeaderDepResolver,
         DefaultTransactionDependencyProvider, SecpCkbRawKeySigner,
     },
-    tx_builder::{transfer::CapacityTransferBuilder, CapacityBalancer, TxBuilder},
+    tx_builder::{balance_tx_capacity, transfer::CapacityTransferBuilder, unlock_tx, CapacityBalancer, TxBuilder},
     unlock::{ScriptUnlocker, SecpSighashUnlocker},
     Address, HumanCapacity, ScriptId,
 };
@@ -22,39 +22,16 @@ use ckb_types::{
 
 use super::client;
 
-/// Builds and signs a capacity-transfer transaction from `sender_address`
-/// (unlocked with `sender_private_key`) to `receiver_address`. Does not
-/// broadcast it -- see `broadcast_transaction` for that.
-pub fn create_transaction(
-    sender_address: &str,
-    sender_private_key: &str,
-    receiver_address: &str,
-    amount: &str,
-) -> Result<TransactionView> {
-    let sender = Address::from_str(sender_address).map_err(|e| anyhow!("Invalid sender address: {e}"))?;
-    let sender_key = secp256k1::SecretKey::from_slice(
-        &hex::decode(sender_private_key.trim_start_matches("0x")).context("Invalid private key hex")?,
-    )
-    .context("Invalid private key")?;
-
-    let receiver =
-        Address::from_str(receiver_address).map_err(|e| anyhow!("Invalid receiver address: {e}"))?;
-    let capacity = HumanCapacity::from_str(amount).map_err(|e| anyhow!("Invalid amount: {e}"))?;
-
-    let signer = SecpCkbRawKeySigner::new_with_secret_keys(vec![sender_key]);
-    let sighash_unlocker = SecpSighashUnlocker::from(Box::new(signer) as Box<_>);
-    let sighash_script_id = ScriptId::new_type(SIGHASH_TYPE_HASH.clone());
-    let mut unlockers = HashMap::default();
-    unlockers.insert(
-        sighash_script_id,
-        Box::new(sighash_unlocker) as Box<dyn ScriptUnlocker>,
-    );
-
+/// Builds a fee-balanced capacity-transfer transaction from `sender` to
+/// `receiver`, with a correctly-sized placeholder witness on the sender's
+/// input(s) but *no signature*. This step never needs (or sees) a private
+/// key: it only reads public chain state (live cells, cell deps) to select
+/// inputs and compute change.
+fn build_balanced_transfer(sender: &Address, receiver: &Address, capacity: HumanCapacity) -> Result<TransactionView> {
     let placeholder_witness = WitnessArgs::new_builder()
         .lock(Some(Bytes::from(vec![0u8; 65])).pack())
         .build();
-    let balancer =
-        CapacityBalancer::new_simple(sender.payload().into(), placeholder_witness, 1000);
+    let balancer = CapacityBalancer::new_simple(sender.payload().into(), placeholder_witness, 1000);
 
     let url = client::rpc_url();
     let ckb_client = client::connect_client();
@@ -71,20 +48,90 @@ pub fn create_transaction(
     let tx_dep_provider = DefaultTransactionDependencyProvider::new(url.as_str(), 10);
 
     let output = CellOutput::new_builder()
-        .lock(Script::from(&receiver))
+        .lock(Script::from(receiver))
         .capacity(capacity.0)
         .build();
     let builder = CapacityTransferBuilder::new(vec![(output, Bytes::default())]);
-    let (tx, still_locked_groups) = builder
-        .build_unlocked(
-            &mut cell_collector,
-            &cell_dep_resolver,
-            &header_dep_resolver,
-            &tx_dep_provider,
-            &balancer,
-            &unlockers,
-        )
+
+    let base_tx = builder
+        .build_base(&mut cell_collector, &cell_dep_resolver, &header_dep_resolver, &tx_dep_provider)
         .map_err(|e| anyhow!("Failed to build transaction: {e}"))?;
+
+    balance_tx_capacity(
+        &base_tx,
+        &balancer,
+        &mut cell_collector,
+        &tx_dep_provider,
+        &cell_dep_resolver,
+        &header_dep_resolver,
+    )
+    .map_err(|e| anyhow!("Failed to balance transaction capacity: {e}"))
+}
+
+/// Builds an unsigned, fee-balanced transfer transaction ready for the
+/// sender to sign on their own device. This is the non-custodial path: the
+/// server only ever sees public addresses here, never a private key.
+/// Hand the result to a CKB SDK (ckb-sdk-js, lumos, ckb-sdk-python, etc.) on
+/// the client to sign, then submit the signed result to
+/// `parse_signed_transaction` + `broadcast_transaction`.
+pub fn build_unsigned_transaction(
+    sender_address: &str,
+    receiver_address: &str,
+    amount: &str,
+) -> Result<TransactionView> {
+    let sender = Address::from_str(sender_address).map_err(|e| anyhow!("Invalid sender address: {e}"))?;
+    let receiver =
+        Address::from_str(receiver_address).map_err(|e| anyhow!("Invalid receiver address: {e}"))?;
+    let capacity = HumanCapacity::from_str(amount).map_err(|e| anyhow!("Invalid amount: {e}"))?;
+
+    build_balanced_transfer(&sender, &receiver, capacity)
+}
+
+/// Parses a transaction a client has already signed (as CKB JSON) back into
+/// a `TransactionView` so it can be broadcast. Purely a format conversion --
+/// no keys involved, and no trust placed in the caller: an invalid signature
+/// will simply be rejected by the node when broadcasting.
+pub fn parse_signed_transaction(json_tx: ckb_jsonrpc_types::Transaction) -> TransactionView {
+    let packed_tx: ckb_types::packed::Transaction = json_tx.into();
+    packed_tx.into_view()
+}
+
+/// Dev/testing convenience only: builds *and signs* a capacity-transfer
+/// transaction server-side, given the sender's raw private key. Real
+/// clients should use `build_unsigned_transaction` + client-side signing
+/// instead -- this exists purely for quick local/devnet iteration and must
+/// stay behind the `ALLOW_DEV_KEY_ENDPOINTS` gate (see `services::dev_guard`).
+pub fn create_transaction(
+    sender_address: &str,
+    sender_private_key: &str,
+    receiver_address: &str,
+    amount: &str,
+) -> Result<TransactionView> {
+    let sender = Address::from_str(sender_address).map_err(|e| anyhow!("Invalid sender address: {e}"))?;
+    let sender_key = secp256k1::SecretKey::from_slice(
+        &hex::decode(sender_private_key.trim_start_matches("0x")).context("Invalid private key hex")?,
+    )
+    .context("Invalid private key")?;
+
+    let receiver =
+        Address::from_str(receiver_address).map_err(|e| anyhow!("Invalid receiver address: {e}"))?;
+    let capacity = HumanCapacity::from_str(amount).map_err(|e| anyhow!("Invalid amount: {e}"))?;
+
+    let balanced_tx = build_balanced_transfer(&sender, &receiver, capacity)?;
+
+    let signer = SecpCkbRawKeySigner::new_with_secret_keys(vec![sender_key]);
+    let sighash_unlocker = SecpSighashUnlocker::from(Box::new(signer) as Box<_>);
+    let sighash_script_id = ScriptId::new_type(SIGHASH_TYPE_HASH.clone());
+    let mut unlockers = HashMap::default();
+    unlockers.insert(
+        sighash_script_id,
+        Box::new(sighash_unlocker) as Box<dyn ScriptUnlocker>,
+    );
+
+    let url = client::rpc_url();
+    let tx_dep_provider = DefaultTransactionDependencyProvider::new(url.as_str(), 10);
+    let (tx, still_locked_groups) = unlock_tx(balanced_tx, &tx_dep_provider, &unlockers)
+        .map_err(|e| anyhow!("Failed to sign transaction: {e}"))?;
 
     if !still_locked_groups.is_empty() {
         bail!("Failed to unlock all script groups on the transaction");

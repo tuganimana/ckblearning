@@ -1,0 +1,12 @@
+target
+.git
+.gitignore
+.env
+.env.*
+!.env-sample
+Dockerfile
+.dockerignore
+**/*.md
+.cursor
+.vscode
+agent-transcripts

@@ -1,6 +1,13 @@
 pub mod balance_service;
+pub mod dev_guard;
+pub mod dev_send_transaction_service;
+pub mod dev_wallet_balance_service;
 pub mod generate_address_service;
 pub mod generate_mnemonic_service;
-pub mod send_transaction_service;
+pub mod transaction_broadcast_service;
+pub mod transaction_build_service;
 pub mod transaction_history_service;
 pub mod wallet;
+pub mod wallet_address_service;
+pub mod wallet_balance_service;
+pub mod xpub_wallet;

@@ -1,33 +1,12 @@
 use axum::{extract::Json, http::StatusCode};
 use bip39::{Language, Mnemonic};
-use ckb_sdk::Address;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::config::balance::get_balance;
+use crate::config::wallet_scan::{get_balance_async, GAP_LIMIT, MAX_SCAN};
 
+use super::dev_guard;
 use super::wallet::derive_wallet;
-const GAP_LIMIT: u32 = 20;
-
-/// Hard safety cap on how many addresses we'll ever derive/check in one request.
-const MAX_SCAN: u32 = 10_000;
-
-async fn get_balance_async(address: Address) -> Result<u64, (StatusCode, String)> {
-    tokio::task::spawn_blocking(move || get_balance(&address))
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Balance task panicked: {e}"),
-            )
-        })?
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to fetch balance: {e}"),
-            )
-        })
-}
 
 async fn find_next_index(mnemonic: &str) -> Result<u32, (StatusCode, String)> {
     let mut last_used_index: Option<u32> = None;
@@ -68,49 +47,64 @@ async fn find_next_index(mnemonic: &str) -> Result<u32, (StatusCode, String)> {
 }
 
 #[derive(Serialize, ToSchema)]
-pub struct GeneratedAddress {
+pub struct DevGeneratedAddress {
     pub mnemonic: String,
     /// Derivation index this address came from (m/44'/309'/0'/0/{index}).
     pub index: u32,
     pub address: String,
     pub public_key: String,
-    pub private_key: String, // i will remove it on prod
+    pub private_key: String,
 }
 
 #[derive(Deserialize, ToSchema)]
-pub struct GenerateAddressRequest {
+pub struct DevGenerateAddressRequest {
     #[serde(default)]
     pub mnemonic: Option<String>,
-  
+
     #[serde(default)]
     pub index: Option<u32>,
 }
 
+/// **Dev/testing only** -- disabled unless `ALLOW_DEV_KEY_ENDPOINTS=true`.
+/// Generates/derives an address *and returns its private key*. Use
+/// `/wallet/address` (account xpub, no private key) for the real,
+/// non-custodial flow.
 #[utoipa::path(
     post,
-    path = "/generate-address",
-    request_body = GenerateAddressRequest,
+    path = "/dev/generate-address",
+    request_body = DevGenerateAddressRequest,
     responses(
-        (status = 200, description = "A new wallet, or the address for the given mnemonic/index", body = GeneratedAddress),
+        (status = 200, description = "A new wallet, or the address for the given mnemonic/index", body = DevGeneratedAddress),
         (status = 400, description = "Invalid mnemonic or derivation path"),
+        (status = 403, description = "Disabled: set ALLOW_DEV_KEY_ENDPOINTS=true to enable for local testing"),
         (status = 500, description = "Failed to fetch balances while scanning for the next unused index")
     )
 )]
 pub async fn generate_address(
-    Json(payload): Json<GenerateAddressRequest>,
-) -> Result<Json<GeneratedAddress>, (StatusCode, String)> {
+    Json(payload): Json<DevGenerateAddressRequest>,
+) -> Result<Json<DevGeneratedAddress>, (StatusCode, String)> {
+    dev_guard::require_enabled()?;
+
     let (mnemonic, index) = match (payload.mnemonic, payload.index) {
         (Some(mnemonic), Some(index)) => (mnemonic, index),
         (Some(mnemonic), None) => {
             let index = find_next_index(&mnemonic).await?;
             (mnemonic, index)
         }
-        (None, _) => (Mnemonic::generate_in(Language::English, 12).unwrap().to_string(), 0),
+        (None, _) => {
+            let mnemonic = Mnemonic::generate_in(Language::English, 12).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to generate mnemonic: {e}"),
+                )
+            })?;
+            (mnemonic.to_string(), 0)
+        }
     };
 
     let wallet = derive_wallet(&mnemonic, index).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
 
-    Ok(Json(GeneratedAddress {
+    Ok(Json(DevGeneratedAddress {
         mnemonic,
         index,
         address: wallet.address.to_string(),

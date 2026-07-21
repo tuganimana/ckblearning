@@ -24,6 +24,8 @@ pub struct TransactionRecord {
     /// "received" when this transaction paid a cell to the address,
     /// "sent" when it spent one from it.
     pub direction: String,
+    /// Amount in Shannons (1 CKB = 100_000_000 Shannons) received or sent.
+    pub amount: u64,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -56,15 +58,17 @@ pub async fn get_transaction_history(
     })
     .await
     .map_err(|e| {
+        eprintln!("transaction history task panicked: {e}");
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Transaction history task panicked: {e}"),
+            "Failed to fetch transaction history. Please try again.".to_string(),
         )
     })?
     .map_err(|e| {
+        eprintln!("failed to fetch transaction history: {e:#}");
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to fetch transaction history: {e}"),
+            "Failed to fetch transaction history. Please try again.".to_string(),
         )
     })?;
 
@@ -74,6 +78,7 @@ pub async fn get_transaction_history(
             tx_hash: record.tx_hash.to_string(),
             block_number: record.block_number,
             direction: record.direction.to_string(),
+            amount: record.amount,
         })
         .collect();
 

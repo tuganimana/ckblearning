@@ -1,7 +1,9 @@
 use bip32::{DerivationPath, XPrv};
 use bip39::{Language, Mnemonic};
-use ckb_sdk::types::{Address, AddressPayload, NetworkType};
+use ckb_sdk::types::{Address, AddressPayload};
 use secp256k1::PublicKey;
+
+use crate::config::client::network_type;
 
 pub struct DerivedWallet {
     pub address: Address,
@@ -27,11 +29,7 @@ pub fn derive_wallet(mnemonic_phrase: &str, index: u32) -> Result<DerivedWallet,
     let pubkey =
         PublicKey::from_slice(&secp_pubkey).map_err(|e| format!("Invalid public key format: {e}"))?;
     let payload = AddressPayload::from_pubkey(&pubkey);
-    let address = Address::new(
-        NetworkType::Testnet, // Change to NetworkType::Mainnet for production!
-        payload,
-        true,
-    );
+    let address = Address::new(network_type(), payload, true);
 
     Ok(DerivedWallet {
         address,

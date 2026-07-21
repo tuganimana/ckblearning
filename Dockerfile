@@ -1,5 +1,6 @@
 # ---- build ----
-FROM rust:1.88-bookworm AS builder
+# ckb-script/ckb-types/ckb-traits 1.1.x (see Cargo.lock) require rustc >= 1.95.
+FROM rust:1.96-bookworm AS builder
 
 WORKDIR /app
 

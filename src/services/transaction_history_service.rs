@@ -21,10 +21,10 @@ pub struct TransactionHistoryRequest {
 pub struct TransactionRecord {
     pub tx_hash: String,
     pub block_number: u64,
-    /// "received" when this transaction paid a cell to the address,
-    /// "sent" when it spent one from it.
+    /// "received" / "sent" for the **net** capacity change of this address in
+    /// the transaction (change outputs are netted out of sends).
     pub direction: String,
-    /// Amount in Shannons (1 CKB = 100_000_000 Shannons) received or sent.
+    /// Net amount in Shannons (1 CKB = 100_000_000 Shannons) received or sent.
     pub amount: u64,
 }
 

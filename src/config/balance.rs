@@ -31,24 +31,28 @@ pub fn get_balance(address: &Address) -> Result<u64> {
     Ok(balance)
 }
 
-/// One cell that was created at ("received") or spent from ("sent") this
-/// address, as reported by the CKB node's indexer.
+/// One netted wallet activity row for an address.
+///
+/// Built from indexer cell movements: inputs ("sent") and outputs
+/// ("received") for the same `tx_hash` are summed, then reported as a
+/// single direction + amount (so change-back cells don't appear as
+/// separate receives).
 pub struct TransactionRecord {
     pub tx_hash: H256,
     pub block_number: u64,
-    /// "received" when a cell locked to this address was created by this
-    /// transaction, "sent" when one was spent as an input.
+    /// "received" when net capacity for this address increased,
+    /// "sent" when it decreased.
     pub direction: &'static str,
-    /// The cell's capacity in Shannons: the amount received (for an output
-    /// cell) or spent (for an input cell).
+    /// Net capacity change in Shannons for this address in the tx.
     pub amount: u64,
 }
 
 /// Lists the most recent transactions that touched `address`, newest first.
-/// This is how you find out a payment actually arrived (and its tx hash),
-/// rather than only ever seeing the current lump balance: poll this (or
-/// `get_balance`) periodically and look for new "received" entries you
-/// haven't seen before.
+///
+/// One entry **per transaction**, with the **net** capacity change for this
+/// address. A send that spends an input and creates a change output back to
+/// the same address is reported as a single "sent" row (not a fake "received"
+/// for the change cell).
 pub fn list_transactions(address: &Address, limit: u32) -> Result<Vec<TransactionRecord>> {
     let ckb_client = client::connect_client();
 
@@ -59,13 +63,16 @@ pub fn list_transactions(address: &Address, limit: u32) -> Result<Vec<Transactio
         script_search_mode: None,
         filter: None,
         with_data: None,
-        // Explicitly ungrouped: one row per matching cell, each with its own
-        // io_type, instead of one row per transaction with a list of cells.
+        // Ungrouped: one indexer row per matching cell. We net them by tx_hash
+        // below so wallet UIs see transfer amounts, not raw cell movements.
         group_by_transaction: Some(false),
     };
 
+    // Fetch extra cell rows so netting still yields ~`limit` transactions.
+    let fetch_limit = limit.saturating_mul(3).clamp(limit, 100);
+
     let page = ckb_client
-        .get_transactions(search_key, Order::Desc, limit.into(), None)
+        .get_transactions(search_key, Order::Desc, fetch_limit.into(), None)
         .map_err(|e| anyhow!("Failed to fetch transactions: {e}"))?;
 
     let entries: Vec<_> = page
@@ -81,7 +88,7 @@ pub fn list_transactions(address: &Address, limit: u32) -> Result<Vec<Transactio
     // Working out the amount takes 1-2 extra RPC round trips per entry (see
     // `resolve_amount`), so resolve them concurrently on plain OS threads
     // rather than one at a time.
-    let records = thread::scope(|scope| {
+    let cell_records = thread::scope(|scope| {
         entries
             .into_iter()
             .map(|(tx_hash, block_number, io_index, io_type)| {
@@ -108,7 +115,56 @@ pub fn list_transactions(address: &Address, limit: u32) -> Result<Vec<Transactio
             .collect::<Result<Vec<_>>>()
     })?;
 
-    Ok(records)
+    Ok(net_transactions_by_hash(cell_records, limit))
+}
+
+/// Collapse per-cell rows into one wallet-facing entry per `tx_hash`.
+fn net_transactions_by_hash(cell_records: Vec<TransactionRecord>, limit: u32) -> Vec<TransactionRecord> {
+    use std::collections::HashMap;
+
+    let mut order: Vec<H256> = Vec::new();
+    let mut received: HashMap<H256, u64> = HashMap::new();
+    let mut sent: HashMap<H256, u64> = HashMap::new();
+    let mut block_numbers: HashMap<H256, u64> = HashMap::new();
+
+    for record in cell_records {
+        if !block_numbers.contains_key(&record.tx_hash) {
+            order.push(record.tx_hash.clone());
+            block_numbers.insert(record.tx_hash.clone(), record.block_number);
+        }
+        match record.direction {
+            "received" => {
+                *received.entry(record.tx_hash).or_insert(0) += record.amount;
+            }
+            _ => {
+                *sent.entry(record.tx_hash).or_insert(0) += record.amount;
+            }
+        }
+    }
+
+    let mut netted = Vec::new();
+    for tx_hash in order {
+        let in_amount = *received.get(&tx_hash).unwrap_or(&0);
+        let out_amount = *sent.get(&tx_hash).unwrap_or(&0);
+        let (direction, amount) = if in_amount > out_amount {
+            ("received", in_amount - out_amount)
+        } else if out_amount > in_amount {
+            ("sent", out_amount - in_amount)
+        } else {
+            continue;
+        };
+        netted.push(TransactionRecord {
+            block_number: *block_numbers.get(&tx_hash).unwrap_or(&0),
+            tx_hash,
+            direction,
+            amount,
+        });
+        if netted.len() as u32 >= limit {
+            break;
+        }
+    }
+
+    netted
 }
 
 /// Resolves the capacity (in Shannons) of the cell referenced by

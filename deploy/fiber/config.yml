@@ -47,8 +47,12 @@ fiber:
             dep_type: code
 
 rpc:
-  # Reachable by other containers on the compose network. Not published publicly.
-  listening_addr: "0.0.0.0:8227"
+  # Must be a private address unless rpc.biscuit_public_key is set.
+  # 0.0.0.0 is "public" → Fiber refuses to start without biscuit auth.
+  # 172.17.0.1 is the default docker0 gateway (private). Fiber runs with
+  # --network host so this binds on the Droplet; the app uses
+  # FIBER_RPC_URL=http://172.17.0.1:8227.
+  listening_addr: "172.17.0.1:8227"
 
 ckb:
   rpc_url: "https://testnet.ckbapp.dev/"

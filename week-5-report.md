@@ -6,43 +6,32 @@
 ### Courses Completed
 
 - **Deploy the app**
-  - **Dockerize app**
-    - Route requests to handlers in rust.
-    - Declaratively parse requests using extractors.
-    - Understand error handling model.
-    - Generate responses with minimal boilerplate.
-    - Take full advantage of the tower and tower-http ecosystem of middleware, services, and utilities.
-    - able to run how serde works wiith json handling
+  - Dockerized the Rust API (`Dockerfile`).
+  - Set up GitHub Actions to build and push the image to DigitalOcean registry.
+  - Deployed the app container to a Droplet (`deploy.yml`).
 
-    - Route requests to handlers in rust.
-    - Declaratively parse requests using extractors.
-    - Understand error handling model.
-    - Generate responses with minimal boilerplate.
-    - Take full advantage of the tower and tower-http ecosystem of middleware, services, and utilities.
-
-- **Fiber Introducution**
-  - I was able to run complete appi to generate mnnemonic
-  - Generate address endpoint.
-  - generate transfer (send ckb) endppoinnt .
-  - ![swagger docs](screenshots/api.png)
-  - Being able to get trasactio on address
-  - ![CKB address balance](screenshots/generate-api.png)
+- **Fiber node deployment**
+  - Wrote Fiber testnet config (`deploy/fiber/config.yml`) — P2P + RPC, bootnodes.
+  - Automated Fiber deploy via GitHub Actions (`deploy-fiber.yml`).
+  - Ran Fiber as a Docker container on the Droplet (ports `8228` / `8227`).
+  - Wired the app to Fiber RPC (`FIBER_RPC_URL`) so `/fiber/*` works after deploy.
 
 ### Key Learnings
 
 - **Fiber**
-  - Learn how to connect to fiber node  .
-  - utopia for swagger docs.
-  - Serde ( Serialization and deserialiization).
-  - Todio.
+  - How a Fiber node is configured and announced on testnet.
+  - Connecting the API to a remote Fiber RPC endpoint.
+  - Docker + GitHub Actions for VPS deploy (secrets, volumes, port publish).
 
 ### Practical Progress
 
-- Successfully implemented address generation from a mnemonic usin API.
-- Tested CKB transactions successfully through api.
-- Implemented balance retrieval from Mnemnomic ( still in progress).
+- Fiber node running on Droplet via CI deploy.
+- App redeploy picks up Fiber RPC and can talk to the node.
+- Address / transfer API work from prior weeks still in place against this setup.
+-  deploy Rust app to digital ocean
 
 ### Environment Setup
 
-- Setting up railway for test deployment.
-- Learning how to dockerize Rust project.
+- DigitalOcean Droplet + Container Registry.
+- GitHub Actions secrets for Droplet SSH, Fiber key, and announced P2P addr.
+- Fiber image: `nervos/fiber` (testnet).

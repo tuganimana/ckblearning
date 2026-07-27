@@ -2,9 +2,9 @@ use axum::{routing::post, Router};
 
 use crate::services::{
     balance_service, dev_send_transaction_service, dev_wallet_balance_service,
-    generate_address_service, generate_mnemonic_service, transaction_broadcast_service,
-    transaction_build_service, transaction_history_service, wallet_address_service,
-    wallet_balance_service,
+    fiber_invoice_service, fiber_payment_service, fiber_swap_service, generate_address_service,
+    generate_mnemonic_service, transaction_broadcast_service, transaction_build_service,
+    transaction_history_service, wallet_address_service, wallet_balance_service,
 };
 
 pub fn address_router() -> Router {
@@ -30,6 +30,41 @@ pub fn address_router() -> Router {
         .route(
             "/transaction/broadcast",
             post(transaction_broadcast_service::broadcast),
+        )
+        // -- Fiber Network (invoices, payments, CCH swaps). Requires FIBER_RPC_URL. --
+        .route("/fiber/invoice/new", post(fiber_invoice_service::new_invoice))
+        .route(
+            "/fiber/invoice/parse",
+            post(fiber_invoice_service::parse_invoice),
+        )
+        .route("/fiber/invoice/get", post(fiber_invoice_service::get_invoice))
+        .route(
+            "/fiber/invoice/cancel",
+            post(fiber_invoice_service::cancel_invoice),
+        )
+        .route(
+            "/fiber/invoice/settle",
+            post(fiber_invoice_service::settle_invoice),
+        )
+        .route(
+            "/fiber/payment/send",
+            post(fiber_payment_service::send_payment),
+        )
+        .route(
+            "/fiber/payment/get",
+            post(fiber_payment_service::get_payment),
+        )
+        .route(
+            "/fiber/swap/ckb-to-lightning",
+            post(fiber_swap_service::ckb_to_lightning),
+        )
+        .route(
+            "/fiber/swap/btc-to-ckb",
+            post(fiber_swap_service::btc_to_ckb),
+        )
+        .route(
+            "/fiber/swap/order",
+            post(fiber_swap_service::get_cch_order),
         )
         // -- Dev/testing-only: disabled unless ALLOW_DEV_KEY_ENDPOINTS=true --
         .route(

@@ -24,3 +24,4 @@ utoipa = { version = "5.5.0", features = ["axum_extras"] }
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
 tower-http = { version = "0.7.0", features = ["cors", "limit", "timeout", "set-header"] }
 tower_governor = { version = "0.8.0", default-features = false, features = ["axum"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

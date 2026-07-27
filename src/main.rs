@@ -28,6 +28,20 @@ async fn main() {
         println!("/dev/* key-handling endpoints are disabled (set ALLOW_DEV_KEY_ENDPOINTS=true to enable for local testing)");
     }
 
+    match config::fiber_client::fiber_rpc_url() {
+        Some(url) => {
+            println!(
+                "Fiber RPC enabled (FIBER_RPC_URL={url}, currency={})",
+                config::fiber_client::fiber_currency()
+            );
+        }
+        None => {
+            println!(
+                "/fiber/* endpoints require FIBER_RPC_URL (unset -- Fiber calls will return 503)"
+            );
+        }
+    }
+
     let app = app_router();
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "5000".to_string());

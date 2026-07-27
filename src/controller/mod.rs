@@ -70,6 +70,17 @@ fn cors_layer() -> CorsLayer {
         crate::services::transaction_history_service::get_transaction_history,
         crate::services::transaction_build_service::build_transaction,
         crate::services::transaction_broadcast_service::broadcast,
+        // Fiber Network -- invoices, payments, CCH cross-chain swaps.
+        crate::services::fiber_invoice_service::new_invoice,
+        crate::services::fiber_invoice_service::parse_invoice,
+        crate::services::fiber_invoice_service::get_invoice,
+        crate::services::fiber_invoice_service::cancel_invoice,
+        crate::services::fiber_invoice_service::settle_invoice,
+        crate::services::fiber_payment_service::send_payment,
+        crate::services::fiber_payment_service::get_payment,
+        crate::services::fiber_swap_service::ckb_to_lightning,
+        crate::services::fiber_swap_service::btc_to_ckb,
+        crate::services::fiber_swap_service::get_cch_order,
         // Dev/testing-only -- disabled unless ALLOW_DEV_KEY_ENDPOINTS=true.
         crate::services::generate_mnemonic_service::generate_mnemonic,
         crate::services::generate_address_service::generate_address,
@@ -91,6 +102,22 @@ fn cors_layer() -> CorsLayer {
         crate::services::transaction_build_service::BuildTransactionResponse,
         crate::services::transaction_broadcast_service::BroadcastTransactionRequest,
         crate::services::transaction_broadcast_service::BroadcastTransactionResponse,
+        crate::services::fiber_invoice_service::NewFiberInvoiceRequest,
+        crate::services::fiber_invoice_service::NewFiberInvoiceResponse,
+        crate::services::fiber_invoice_service::ParseFiberInvoiceRequest,
+        crate::services::fiber_invoice_service::ParseFiberInvoiceResponse,
+        crate::services::fiber_invoice_service::GetFiberInvoiceRequest,
+        crate::services::fiber_invoice_service::GetFiberInvoiceResponse,
+        crate::services::fiber_invoice_service::CancelFiberInvoiceRequest,
+        crate::services::fiber_invoice_service::SettleFiberInvoiceRequest,
+        crate::services::fiber_invoice_service::SettleFiberInvoiceResponse,
+        crate::services::fiber_payment_service::SendFiberPaymentRequest,
+        crate::services::fiber_payment_service::SendFiberPaymentResponse,
+        crate::services::fiber_payment_service::GetFiberPaymentRequest,
+        crate::services::fiber_swap_service::CkbToLightningRequest,
+        crate::services::fiber_swap_service::BtcToCkbRequest,
+        crate::services::fiber_swap_service::GetCchOrderRequest,
+        crate::services::fiber_swap_service::CchOrderResponse,
         crate::services::generate_mnemonic_service::DevGeneratedMnemonic,
         crate::services::generate_address_service::DevGeneratedAddress,
         crate::services::generate_address_service::DevGenerateAddressRequest,
@@ -99,7 +126,10 @@ fn cors_layer() -> CorsLayer {
         crate::services::dev_wallet_balance_service::DevWalletBalanceResponse,
         crate::services::dev_send_transaction_service::DevSendTransactionRequest,
         crate::services::dev_send_transaction_service::DevSendTransactionResponse,
-    ))
+    )),
+    tags(
+        (name = "fiber", description = "Fiber Network invoices, payments, and CKB↔Lightning CCH swaps")
+    )
 )]
 struct ApiDoc;
 

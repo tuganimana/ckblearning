@@ -12,7 +12,7 @@
     - Understand error handling model.
     - Generate responses with minimal boilerplate.
     - Take full advantage of the tower and tower-http ecosystem of middleware, services, and utilities.
-    - able to run how serde works wiith json handling 
+    - able to run how serde works wiith json handling
 
     - Route requests to handlers in rust.
     - Declaratively parse requests using extractors.
@@ -20,14 +20,13 @@
     - Generate responses with minimal boilerplate.
     - Take full advantage of the tower and tower-http ecosystem of middleware, services, and utilities.
 
-- **APIs**
+- **Fiber Introducution**
   - I was able to run complete appi to generate mnnemonic
-  -  Generate address endpoint.
+  - Generate address endpoint.
   - generate transfer (send ckb) endppoinnt .
   - ![swagger docs](screenshots/api.png)
-  -  Being able to get trasactio on address
+  - Being able to get trasactio on address
   - ![CKB address balance](screenshots/generate-api.png)
-
 
 ### Key Learnings
 
@@ -37,12 +36,11 @@
   - Serde ( Serialization and deserialiization).
   - Todio.
 
-
 ### Practical Progress
 
 - Successfully implemented address generation from a mnemonic usin API.
 - Tested CKB transactions successfully through api.
-- Implemented balance retrieval  from Mnemnomic ( still in progress).
+- Implemented balance retrieval from Mnemnomic ( still in progress).
 
 ### Environment Setup
 

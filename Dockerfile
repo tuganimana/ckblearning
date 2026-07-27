@@ -21,7 +21,7 @@ WORKDIR /app
 COPY --from=builder /app/target/release/ckb-rust /app/ckb-rust
 
 # Railway injects PORT; default for local `docker run`
-ENV PORT=8080
-EXPOSE 8080
+ENV PORT=5050
+EXPOSE 5050
 
 CMD ["./ckb-rust"]

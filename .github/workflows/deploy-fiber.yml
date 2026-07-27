@@ -1,25 +1,3 @@
-# Deploy Fiber Network Node (FNN) to the Droplet.
-# New workflow only — does NOT modify .github/workflows/deploy.yml.
-#
-# Same pattern as the app deploy: SSH into the Droplet, pull image,
-# docker run -d --restart unless-stopped.
-#
-# Required GitHub secrets (reuse Droplet ones from the app workflow):
-#   DROPLET_HOST, DROPLET_USERNAME, DROPLET_PASSWORD
-#   FIBER_SECRET_KEY_PASSWORD
-#
-# Optional:
-#   FIBER_CKB_KEY — hex CKB private key; written once to ~/fiber-node/ckb/key
-#                   if that file does not already exist
-#   FIBER_ANNOUNCED_ADDR — e.g. /ip4/YOUR.PUBLIC.IP/tcp/8228
-#
-# Public on the VPS after deploy:
-#   - :8228  Fiber P2P (peers / routing)
-#   - :8227  Fiber JSON-RPC (open — lock down with ufw/security group if needed)
-#
-# The app container reaches Fiber via the Docker host gateway so this keeps
-# working after a normal deploy.yml run (which uses --env-file ~/kaze-ckb/.env):
-#   FIBER_RPC_URL=http://172.17.0.1:8227
 
 name: Deploy Fiber Node
 

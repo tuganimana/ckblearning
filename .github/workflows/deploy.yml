@@ -91,7 +91,8 @@ jobs:
             sdocker() { echo "$DROPLET_PASSWORD" | sudo -S docker "$@"; }
 
             FULL_IMAGE="$IMAGE:$IMAGE_TAG"
-            ENV_FILE="/home/telesphore/kaze-ckb/.env"
+            APP_DIR="${HOME}/kaze-ckb"
+            ENV_FILE="${APP_DIR}/.env"
 
             echo "Logging into registry..."
             echo "$DROPLET_PASSWORD" | sudo -S sh -c "printf '%s' \"$DO_TOKEN\" | docker login \"$REGISTRY\" -u \"$DO_TOKEN\" --password-stdin"
@@ -103,6 +104,7 @@ jobs:
             sdocker stop "$CONTAINER_NAME" || true
             sdocker rm "$CONTAINER_NAME" || true
 
+            mkdir -p "$APP_DIR"
             if [ ! -f "$ENV_FILE" ]; then
               echo "Missing env file: $ENV_FILE" >&2
               exit 1

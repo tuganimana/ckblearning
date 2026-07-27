@@ -96,6 +96,8 @@ jobs:
             fi
 
             sdocker() { echo "$DROPLET_PASSWORD" | sudo -S docker "$@"; }
+            # ~/kaze-ckb/.env is often root-owned on the Droplet
+            ssudo() { echo "$DROPLET_PASSWORD" | sudo -S "$@"; }
 
             FIBER_DIR="${HOME}/fiber-node"
             APP_DIR="${HOME}/kaze-ckb"
@@ -104,7 +106,7 @@ jobs:
             KEY_FILE="${FIBER_DIR}/ckb/key"
             FULL_IMAGE="${FIBER_IMAGE}:${FIBER_IMAGE_TAG}"
 
-            mkdir -p "${FIBER_DIR}/ckb" "${APP_DIR}"
+            mkdir -p "${FIBER_DIR}/ckb"
 
             if [ ! -f "$CONFIG_FILE" ]; then
               echo "Missing Fiber config at $CONFIG_FILE (scp step failed?)" >&2
@@ -146,12 +148,14 @@ jobs:
               -e "RUST_LOG=info" \
               "$FULL_IMAGE"
 
-            # So deploy.yml (unchanged) picks this up via --env-file on next app deploy
-            touch "$ENV_FILE"
-            if grep -q '^FIBER_RPC_URL=' "$ENV_FILE"; then
-              sed -i "s|^FIBER_RPC_URL=.*|FIBER_RPC_URL=${FIBER_RPC_URL_FOR_APP}|" "$ENV_FILE"
+            # So deploy.yml (unchanged) picks this up via --env-file on next app deploy.
+            # Use sudo — APP_DIR/.env is frequently root-owned on the Droplet.
+            ssudo mkdir -p "$APP_DIR"
+            ssudo touch "$ENV_FILE"
+            if ssudo grep -q '^FIBER_RPC_URL=' "$ENV_FILE"; then
+              ssudo sed -i "s|^FIBER_RPC_URL=.*|FIBER_RPC_URL=${FIBER_RPC_URL_FOR_APP}|" "$ENV_FILE"
             else
-              printf '\nFIBER_RPC_URL=%s\n' "$FIBER_RPC_URL_FOR_APP" >> "$ENV_FILE"
+              printf '\nFIBER_RPC_URL=%s\n' "$FIBER_RPC_URL_FOR_APP" | ssudo tee -a "$ENV_FILE" >/dev/null
             fi
 
             # Hot-reload the running app so /fiber/* works immediately

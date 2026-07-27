@@ -1,0 +1,28 @@
+# Optional: ensure `docker compose up -d` runs after every reboot.
+# Docker's own restart policies usually already restart containers; this is
+# an extra safety net if you want an explicit unit.
+#
+# On the VPS:
+#   sudo cp deploy/fiber/systemd-docker-compose.example.service \
+#     /etc/systemd/system/kaze-ckb.service
+#   # Edit WorkingDirectory to the real path of this repo on the VPS
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now docker
+#   sudo systemctl enable --now kaze-ckb.service
+
+[Unit]
+Description=Kaze CKB API + Fiber (docker compose)
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/home/YOUR_USER/ckblearning
+ExecStart=/usr/bin/docker compose up -d
+ExecStop=/usr/bin/docker compose stop
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,185 @@
+# Deploy Fiber Network Node (FNN) to the Droplet.
+# New workflow only — does NOT modify .github/workflows/deploy.yml.
+#
+# Same pattern as the app deploy: SSH into the Droplet, pull image,
+# docker run -d --restart unless-stopped.
+#
+# Required GitHub secrets (reuse Droplet ones from the app workflow):
+#   DROPLET_HOST, DROPLET_USERNAME, DROPLET_PASSWORD
+#   FIBER_SECRET_KEY_PASSWORD
+#
+# Optional:
+#   FIBER_CKB_KEY — hex CKB private key; written once to ~/fiber-node/ckb/key
+#                   if that file does not already exist
+#   FIBER_ANNOUNCED_ADDR — e.g. /ip4/YOUR.PUBLIC.IP/tcp/8228
+#
+# Public on the VPS after deploy:
+#   - :8228  Fiber P2P (peers / routing)
+#   - :8227  Fiber JSON-RPC (open — lock down with ufw/security group if needed)
+#
+# The app container reaches Fiber via the Docker host gateway so this keeps
+# working after a normal deploy.yml run (which uses --env-file ~/kaze-ckb/.env):
+#   FIBER_RPC_URL=http://172.17.0.1:8227
+
+name: Deploy Fiber Node
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "deploy/fiber/**"
+      - ".github/workflows/deploy-fiber.yml"
+  workflow_dispatch:
+    inputs:
+      fiber_image_tag:
+        description: "nervos/fiber image tag"
+        required: false
+        default: "0.9.0-rc7"
+
+env:
+  FIBER_IMAGE: nervos/fiber
+  FIBER_IMAGE_TAG: ${{ github.event.inputs.fiber_image_tag || '0.9.0-rc7' }}
+  FIBER_CONTAINER: fiber-node
+  APP_CONTAINER: kaze-ckb
+  FIBER_P2P_PORT: "8228"
+  FIBER_RPC_PORT: "8227"
+  APP_PORT: "5050"
+  # Default docker0 bridge gateway — reachable from app container after deploy.yml
+  FIBER_RPC_URL_FOR_APP: "http://172.17.0.1:8227"
+
+jobs:
+  deploy-fiber:
+    name: Deploy Fiber to Droplet
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Copy Fiber config to Droplet
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.DROPLET_HOST }}
+          username: ${{ secrets.DROPLET_USERNAME }}
+          password: ${{ secrets.DROPLET_PASSWORD }}
+          source: "deploy/fiber/config.yml"
+          target: "~/fiber-node/"
+          strip_components: 2
+
+      - name: Deploy Fiber via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          DROPLET_PASSWORD: ${{ secrets.DROPLET_PASSWORD }}
+          FIBER_SECRET_KEY_PASSWORD: ${{ secrets.FIBER_SECRET_KEY_PASSWORD }}
+          FIBER_CKB_KEY: ${{ secrets.FIBER_CKB_KEY }}
+          FIBER_ANNOUNCED_ADDR: ${{ secrets.FIBER_ANNOUNCED_ADDR }}
+          FIBER_IMAGE: ${{ env.FIBER_IMAGE }}
+          FIBER_IMAGE_TAG: ${{ env.FIBER_IMAGE_TAG }}
+          FIBER_CONTAINER: ${{ env.FIBER_CONTAINER }}
+          APP_CONTAINER: ${{ env.APP_CONTAINER }}
+          FIBER_P2P_PORT: ${{ env.FIBER_P2P_PORT }}
+          FIBER_RPC_PORT: ${{ env.FIBER_RPC_PORT }}
+          APP_PORT: ${{ env.APP_PORT }}
+          FIBER_RPC_URL_FOR_APP: ${{ env.FIBER_RPC_URL_FOR_APP }}
+        with:
+          host: ${{ secrets.DROPLET_HOST }}
+          username: ${{ secrets.DROPLET_USERNAME }}
+          password: ${{ secrets.DROPLET_PASSWORD }}
+          envs: DROPLET_PASSWORD,FIBER_SECRET_KEY_PASSWORD,FIBER_CKB_KEY,FIBER_ANNOUNCED_ADDR,FIBER_IMAGE,FIBER_IMAGE_TAG,FIBER_CONTAINER,APP_CONTAINER,FIBER_P2P_PORT,FIBER_RPC_PORT,APP_PORT,FIBER_RPC_URL_FOR_APP
+          script: |
+            set -euxo pipefail
+
+            if [ -z "${FIBER_SECRET_KEY_PASSWORD:-}" ]; then
+              echo "Missing secret FIBER_SECRET_KEY_PASSWORD" >&2
+              exit 1
+            fi
+
+            sdocker() { echo "$DROPLET_PASSWORD" | sudo -S docker "$@"; }
+
+            FIBER_DIR="${HOME}/fiber-node"
+            APP_DIR="${HOME}/kaze-ckb"
+            ENV_FILE="${APP_DIR}/.env"
+            CONFIG_FILE="${FIBER_DIR}/config.yml"
+            KEY_FILE="${FIBER_DIR}/ckb/key"
+            FULL_IMAGE="${FIBER_IMAGE}:${FIBER_IMAGE_TAG}"
+
+            mkdir -p "${FIBER_DIR}/ckb" "${APP_DIR}"
+
+            if [ ! -f "$CONFIG_FILE" ]; then
+              echo "Missing Fiber config at $CONFIG_FILE (scp step failed?)" >&2
+              exit 1
+            fi
+
+            if [ -n "${FIBER_ANNOUNCED_ADDR:-}" ]; then
+              if ! grep -qF "$FIBER_ANNOUNCED_ADDR" "$CONFIG_FILE"; then
+                sed -i "s|# - \"/ip4/YOUR.VPS.PUBLIC.IP/tcp/8228\"|- \"${FIBER_ANNOUNCED_ADDR}\"|" "$CONFIG_FILE"
+              fi
+            fi
+
+            if [ ! -f "$KEY_FILE" ] && [ -n "${FIBER_CKB_KEY:-}" ]; then
+              umask 077
+              printf '%s' "$FIBER_CKB_KEY" > "$KEY_FILE"
+              chmod 600 "$KEY_FILE"
+              echo "Wrote new Fiber CKB key to $KEY_FILE"
+            fi
+
+            if [ ! -f "$KEY_FILE" ]; then
+              echo "WARNING: $KEY_FILE missing. Create it on the VPS or set secret FIBER_CKB_KEY." >&2
+            fi
+
+            echo "Pulling Fiber image ${FULL_IMAGE}..."
+            sdocker pull "$FULL_IMAGE"
+
+            echo "Stopping old Fiber container..."
+            sdocker stop "$FIBER_CONTAINER" || true
+            sdocker rm "$FIBER_CONTAINER" || true
+
+            echo "Starting Fiber (public P2P :${FIBER_P2P_PORT}, public RPC :${FIBER_RPC_PORT})..."
+            sdocker run -d \
+              --name "$FIBER_CONTAINER" \
+              --restart unless-stopped \
+              -p "${FIBER_P2P_PORT}:${FIBER_P2P_PORT}" \
+              -p "${FIBER_RPC_PORT}:${FIBER_RPC_PORT}" \
+              -v "${FIBER_DIR}:/fiber" \
+              -e "FIBER_SECRET_KEY_PASSWORD=${FIBER_SECRET_KEY_PASSWORD}" \
+              -e "RUST_LOG=info" \
+              "$FULL_IMAGE"
+
+            # So deploy.yml (unchanged) picks this up via --env-file on next app deploy
+            touch "$ENV_FILE"
+            if grep -q '^FIBER_RPC_URL=' "$ENV_FILE"; then
+              sed -i "s|^FIBER_RPC_URL=.*|FIBER_RPC_URL=${FIBER_RPC_URL_FOR_APP}|" "$ENV_FILE"
+            else
+              printf '\nFIBER_RPC_URL=%s\n' "$FIBER_RPC_URL_FOR_APP" >> "$ENV_FILE"
+            fi
+
+            # Hot-reload the running app so /fiber/* works immediately
+            if sdocker inspect "$APP_CONTAINER" >/dev/null 2>&1; then
+              echo "Restarting ${APP_CONTAINER} with Fiber RPC URL..."
+              APP_IMAGE="$(sdocker inspect -f '{{.Config.Image}}' "$APP_CONTAINER")"
+
+              sdocker stop "$APP_CONTAINER" || true
+              sdocker rm "$APP_CONTAINER" || true
+
+              sdocker run -d \
+                --name "$APP_CONTAINER" \
+                --restart unless-stopped \
+                -p "${APP_PORT}:${APP_PORT}" \
+                --env-file "$ENV_FILE" \
+                -e "PORT=${APP_PORT}" \
+                -e "FIBER_RPC_URL=${FIBER_RPC_URL_FOR_APP}" \
+                "$APP_IMAGE"
+            else
+              echo "App container ${APP_CONTAINER} not running yet — Fiber is public; run Deploy Kaze CKB next."
+            fi
+
+            echo "Containers:"
+            sdocker ps -a
+
+            echo "Fiber logs:"
+            sdocker logs "$FIBER_CONTAINER" --tail 80 || true
+
+            sdocker image prune -f
+
+            echo "Done. Public: :${FIBER_P2P_PORT} (P2P), :${FIBER_RPC_PORT} (RPC). App uses ${FIBER_RPC_URL_FOR_APP}"

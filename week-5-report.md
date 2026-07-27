@@ -30,8 +30,8 @@
 
 ### Key Learnings
 
-- **Rest API**
-  - Axum web framewerok .
+- **Fiber**
+  - Learn how to connect to fiber node  .
   - utopia for swagger docs.
   - Serde ( Serialization and deserialiization).
   - Todio.

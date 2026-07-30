@@ -88,32 +88,38 @@ pub fn list_transactions(address: &Address, limit: u32) -> Result<Vec<Transactio
     // Working out the amount takes 1-2 extra RPC round trips per entry (see
     // `resolve_amount`), so resolve them concurrently on plain OS threads
     // rather than one at a time.
+    //
+    // Important: skip individual amount failures instead of failing the whole
+    // request with HTTP 500 — one bad/missing tx used to blank wallet history.
     let cell_records = thread::scope(|scope| {
         entries
             .into_iter()
             .map(|(tx_hash, block_number, io_index, io_type)| {
-                scope.spawn(move || {
-                    let amount = resolve_amount(&tx_hash, io_index, &io_type)?;
-                    Ok(TransactionRecord {
-                        tx_hash,
-                        block_number,
-                        direction: match io_type {
-                            CellType::Output => "received",
-                            CellType::Input => "sent",
-                        },
-                        amount,
-                    })
+                scope.spawn(move || -> Option<TransactionRecord> {
+                    match resolve_amount(&tx_hash, io_index, &io_type) {
+                        Ok(amount) => Some(TransactionRecord {
+                            tx_hash,
+                            block_number,
+                            direction: match io_type {
+                                CellType::Output => "received",
+                                CellType::Input => "sent",
+                            },
+                            amount,
+                        }),
+                        Err(e) => {
+                            eprintln!(
+                                "skipping tx amount lookup {tx_hash}/{io_index:?}: {e:#}"
+                            );
+                            None
+                        }
+                    }
                 })
             })
             .collect::<Vec<_>>()
             .into_iter()
-            .map(|handle| {
-                handle
-                    .join()
-                    .map_err(|_| anyhow!("Transaction amount lookup thread panicked"))?
-            })
-            .collect::<Result<Vec<_>>>()
-    })?;
+            .filter_map(|handle| handle.join().ok().flatten())
+            .collect::<Vec<_>>()
+    });
 
     Ok(net_transactions_by_hash(cell_records, limit))
 }

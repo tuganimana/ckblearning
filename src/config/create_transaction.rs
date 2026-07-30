@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -6,9 +6,12 @@ use ckb_sdk::{
     constants::SIGHASH_TYPE_HASH,
     traits::{
         DefaultCellCollector, DefaultCellDepResolver, DefaultHeaderDepResolver,
-        DefaultTransactionDependencyProvider, SecpCkbRawKeySigner,
+        DefaultTransactionDependencyProvider, SecpCkbRawKeySigner, TransactionDependencyProvider,
     },
-    tx_builder::{balance_tx_capacity, transfer::CapacityTransferBuilder, unlock_tx, CapacityBalancer, TxBuilder},
+    tx_builder::{
+        balance_tx_capacity, transfer::CapacityTransferBuilder, unlock_tx, CapacityBalancer,
+        CapacityProvider, TxBuilder,
+    },
     unlock::{ScriptUnlocker, SecpSighashUnlocker},
     Address, HumanCapacity, ScriptId,
 };
@@ -22,18 +25,20 @@ use ckb_types::{
 
 use super::client;
 
-/// Builds a fee-balanced capacity-transfer transaction from `sender` to
-/// `receiver`, with a correctly-sized placeholder witness on the sender's
-/// input(s) but *no signature*. This step never needs (or sees) a private
-/// key: it only reads public chain state (live cells, cell deps) to select
-/// inputs and compute change.
-fn build_balanced_transfer(sender: &Address, receiver: &Address, capacity: HumanCapacity) -> Result<TransactionView> {
-    let placeholder_witness = WitnessArgs::new_builder()
+fn placeholder_witness() -> WitnessArgs {
+    WitnessArgs::new_builder()
         .lock(Some(Bytes::from(vec![0u8; 65])).pack())
-        .build();
-    let balancer = CapacityBalancer::new_simple(sender.payload().into(), placeholder_witness, 1000);
+        .build()
+}
 
-    let url = client::rpc_url();
+fn build_resolvers(
+    url: &str,
+) -> Result<(
+    DefaultCellDepResolver,
+    DefaultHeaderDepResolver,
+    DefaultCellCollector,
+    DefaultTransactionDependencyProvider,
+)> {
     let ckb_client = client::connect_client();
     let cell_dep_resolver = {
         let genesis_block = ckb_client
@@ -43,9 +48,47 @@ fn build_balanced_transfer(sender: &Address, receiver: &Address, capacity: Human
         DefaultCellDepResolver::from_genesis(&BlockView::from(genesis_block))
             .map_err(|e| anyhow!("Failed to build cell dep resolver: {e}"))?
     };
-    let header_dep_resolver = DefaultHeaderDepResolver::new(url.as_str());
-    let mut cell_collector = DefaultCellCollector::new(url.as_str());
-    let tx_dep_provider = DefaultTransactionDependencyProvider::new(url.as_str(), 10);
+    let header_dep_resolver = DefaultHeaderDepResolver::new(url);
+    let cell_collector = DefaultCellCollector::new(url);
+    let tx_dep_provider = DefaultTransactionDependencyProvider::new(url, 10);
+    Ok((
+        cell_dep_resolver,
+        header_dep_resolver,
+        cell_collector,
+        tx_dep_provider,
+    ))
+}
+
+/// Builds a fee-balanced capacity-transfer from one or more sender locks.
+///
+/// Multiple senders (HD receive indexes) are required when funds are split
+/// across addresses — e.g. 100+100 CKB cannot pay a 100 CKB transfer from a
+/// single lock (fee / 61 CKB change rules), but can when both locks fund the tx.
+fn build_balanced_transfer(
+    senders: &[Address],
+    receiver: &Address,
+    capacity: HumanCapacity,
+) -> Result<TransactionView> {
+    if senders.is_empty() {
+        bail!("At least one sender address is required");
+    }
+
+    let placeholder = placeholder_witness();
+    let provider_locks: Vec<(Script, WitnessArgs)> = senders
+        .iter()
+        .map(|sender| (Script::from(sender), placeholder.clone()))
+        .collect();
+
+    // Change returns to the first (typically richest) sender.
+    let mut balancer = CapacityBalancer::new_with_provider(
+        1000,
+        CapacityProvider::new_simple(provider_locks),
+    );
+    balancer.change_lock_script = Some(Script::from(&senders[0]));
+
+    let url = client::rpc_url();
+    let (cell_dep_resolver, header_dep_resolver, mut cell_collector, tx_dep_provider) =
+        build_resolvers(url.as_str())?;
 
     let output = CellOutput::new_builder()
         .lock(Script::from(receiver))
@@ -54,7 +97,12 @@ fn build_balanced_transfer(sender: &Address, receiver: &Address, capacity: Human
     let builder = CapacityTransferBuilder::new(vec![(output, Bytes::default())]);
 
     let base_tx = builder
-        .build_base(&mut cell_collector, &cell_dep_resolver, &header_dep_resolver, &tx_dep_provider)
+        .build_base(
+            &mut cell_collector,
+            &cell_dep_resolver,
+            &header_dep_resolver,
+            &tx_dep_provider,
+        )
         .map_err(|e| anyhow!("Failed to build transaction: {e}"))?;
 
     balance_tx_capacity(
@@ -68,39 +116,98 @@ fn build_balanced_transfer(sender: &Address, receiver: &Address, capacity: Human
     .map_err(|e| anyhow!("Failed to balance transaction capacity: {e}"))
 }
 
-/// Builds an unsigned, fee-balanced transfer transaction ready for the
-/// sender to sign on their own device. This is the non-custodial path: the
-/// server only ever sees public addresses here, never a private key.
-/// Hand the result to a CKB SDK (ckb-sdk-js, lumos, ckb-sdk-python, etc.) on
-/// the client to sign, then submit the signed result to
-/// `parse_signed_transaction` + `broadcast_transaction`.
+/// Map each sighash script-group's first witness index → sender address string.
+///
+/// Clients use this to sign every input group when funds span multiple HD indexes.
+pub fn signing_plan_for_tx(
+    tx: &TransactionView,
+    known_senders: &[Address],
+) -> Result<Vec<(usize, String)>> {
+    let url = client::rpc_url();
+    let tx_dep_provider = DefaultTransactionDependencyProvider::new(url.as_str(), 10);
+
+    let lock_to_address: HashMap<Script, String> = known_senders
+        .iter()
+        .map(|a| (Script::from(a), a.to_string()))
+        .collect();
+
+    let mut seen_locks = HashSet::new();
+    let mut plan = Vec::new();
+
+    for (idx, input) in tx.inputs().into_iter().enumerate() {
+        let cell = tx_dep_provider
+            .get_cell(&input.previous_output())
+            .map_err(|e| anyhow!("Failed to resolve input cell for signing plan: {e}"))?;
+        let lock = cell.lock();
+        if !seen_locks.insert(lock.clone()) {
+            continue;
+        }
+        let address = lock_to_address.get(&lock).cloned().ok_or_else(|| {
+            anyhow!("Built transaction input lock does not match any provided sender address")
+        })?;
+        plan.push((idx, address));
+    }
+
+    if plan.is_empty() {
+        bail!("Transaction has no inputs to sign");
+    }
+    Ok(plan)
+}
+
+/// Builds an unsigned, fee-balanced transfer ready for client-side signing.
 pub fn build_unsigned_transaction(
     sender_address: &str,
     receiver_address: &str,
     amount: &str,
 ) -> Result<TransactionView> {
-    let sender = Address::from_str(sender_address).map_err(|e| anyhow!("Invalid sender address: {e}"))?;
+    build_unsigned_transaction_multi(&[sender_address.to_string()], receiver_address, amount)
+        .map(|(tx, _)| tx)
+}
+
+/// Multi-sender variant. Returns `(tx, signing_plan)` where `signing_plan` is
+/// `(witness_index, sender_address)` for each distinct lock group.
+pub fn build_unsigned_transaction_multi(
+    sender_addresses: &[String],
+    receiver_address: &str,
+    amount: &str,
+) -> Result<(TransactionView, Vec<(usize, String)>)> {
+    if sender_addresses.is_empty() {
+        bail!("At least one sender address is required");
+    }
+
+    let mut senders = Vec::with_capacity(sender_addresses.len());
+    let mut seen = HashSet::new();
+    for addr in sender_addresses {
+        let trimmed = addr.trim();
+        if trimmed.is_empty() || !seen.insert(trimmed.to_string()) {
+            continue;
+        }
+        senders.push(
+            Address::from_str(trimmed).map_err(|e| anyhow!("Invalid sender address: {e}"))?,
+        );
+    }
+    if senders.is_empty() {
+        bail!("At least one sender address is required");
+    }
+
     let receiver =
         Address::from_str(receiver_address).map_err(|e| anyhow!("Invalid receiver address: {e}"))?;
     let capacity = HumanCapacity::from_str(amount).map_err(|e| anyhow!("Invalid amount: {e}"))?;
 
-    build_balanced_transfer(&sender, &receiver, capacity)
+    let tx = build_balanced_transfer(&senders, &receiver, capacity)?;
+    let plan = signing_plan_for_tx(&tx, &senders)?;
+    Ok((tx, plan))
 }
 
 /// Parses a transaction a client has already signed (as CKB JSON) back into
-/// a `TransactionView` so it can be broadcast. Purely a format conversion --
-/// no keys involved, and no trust placed in the caller: an invalid signature
-/// will simply be rejected by the node when broadcasting.
+/// a `TransactionView` so it can be broadcast.
 pub fn parse_signed_transaction(json_tx: ckb_jsonrpc_types::Transaction) -> TransactionView {
     let packed_tx: ckb_types::packed::Transaction = json_tx.into();
     packed_tx.into_view()
 }
 
 /// Dev/testing convenience only: builds *and signs* a capacity-transfer
-/// transaction server-side, given the sender's raw private key. Real
-/// clients should use `build_unsigned_transaction` + client-side signing
-/// instead -- this exists purely for quick local/devnet iteration and must
-/// stay behind the `ALLOW_DEV_KEY_ENDPOINTS` gate (see `services::dev_guard`).
+/// transaction server-side, given the sender's raw private key.
 pub fn create_transaction(
     sender_address: &str,
     sender_private_key: &str,
@@ -117,7 +224,7 @@ pub fn create_transaction(
         Address::from_str(receiver_address).map_err(|e| anyhow!("Invalid receiver address: {e}"))?;
     let capacity = HumanCapacity::from_str(amount).map_err(|e| anyhow!("Invalid amount: {e}"))?;
 
-    let balanced_tx = build_balanced_transfer(&sender, &receiver, capacity)?;
+    let balanced_tx = build_balanced_transfer(&[sender], &receiver, capacity)?;
 
     let signer = SecpCkbRawKeySigner::new_with_secret_keys(vec![sender_key]);
     let sighash_unlocker = SecpSighashUnlocker::from(Box::new(signer) as Box<_>);

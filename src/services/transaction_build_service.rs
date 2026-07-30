@@ -2,12 +2,18 @@ use axum::{extract::Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::config::create_transaction::build_unsigned_transaction;
+use crate::config::create_transaction::build_unsigned_transaction_multi;
 
 #[derive(Deserialize, ToSchema)]
 pub struct BuildTransactionRequest {
     /// Sender's CKB address (public -- no key material).
-    pub sender_address: String,
+    /// Ignored when `sender_addresses` is non-empty.
+    #[serde(default)]
+    pub sender_address: Option<String>,
+    /// One or more sender addresses (HD indexes). Use this when balance is
+    /// split across receive addresses so inputs can be aggregated.
+    #[serde(default)]
+    pub sender_addresses: Option<Vec<String>>,
     /// Recipient CKB address.
     pub receiver_address: String,
     /// Amount to send, in CKB, e.g. "100.0".
@@ -15,25 +21,57 @@ pub struct BuildTransactionRequest {
 }
 
 #[derive(Serialize, ToSchema)]
+pub struct BuildTransactionSigner {
+    /// Witness index that must carry this lock's secp256k1 signature.
+    pub witness_index: u32,
+    /// Address whose private key signs this witness.
+    pub address: String,
+}
+
+#[derive(Serialize, ToSchema)]
 pub struct BuildTransactionResponse {
     /// Unsigned, fee-balanced transaction in CKB's standard JSON transaction
-    /// format (same shape the CKB RPC/indexer use). Sign it on the client
-    /// with the sender's private key -- which never leaves the client --
-    /// using an official CKB SDK (ckb-sdk-js, lumos, ckb-sdk-python, the
-    /// Rust `ckb-sdk` crate, etc: they all consume/produce this exact JSON
-    /// shape), then submit the signed result to `/transaction/broadcast`.
+    /// format. Sign every entry in `signers` on the client, then submit to
+    /// `/transaction/broadcast`.
     #[schema(value_type = Object)]
     pub transaction: serde_json::Value,
     pub sender_address: String,
     pub receiver_address: String,
     pub amount: String,
+    /// One entry per distinct input lock group (multi-HD sends have >1).
+    pub signers: Vec<BuildTransactionSigner>,
 }
 
-/// Builds a fee-balanced transfer transaction *without signing it*. This
-/// endpoint only ever touches public chain data (live cells, cell deps) --
-/// it never needs, sees, or asks for a private key. Pair with client-side
-/// signing and `/transaction/broadcast` for the full non-custodial send
-/// flow.
+fn resolve_senders(payload: &BuildTransactionRequest) -> Result<Vec<String>, (StatusCode, String)> {
+    let mut senders = Vec::new();
+    if let Some(list) = &payload.sender_addresses {
+        for addr in list {
+            let trimmed = addr.trim();
+            if !trimmed.is_empty() {
+                senders.push(trimmed.to_string());
+            }
+        }
+    }
+    if senders.is_empty() {
+        if let Some(single) = payload
+            .sender_address
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            senders.push(single);
+        }
+    }
+    if senders.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "sender_address or sender_addresses is required".to_string(),
+        ));
+    }
+    Ok(senders)
+}
+
+/// Builds a fee-balanced transfer transaction *without signing it*.
 #[utoipa::path(
     post,
     path = "/transaction/build",
@@ -47,14 +85,13 @@ pub struct BuildTransactionResponse {
 pub async fn build_transaction(
     Json(payload): Json<BuildTransactionRequest>,
 ) -> Result<Json<BuildTransactionResponse>, (StatusCode, String)> {
-    let sender_address = payload.sender_address.clone();
+    let senders = resolve_senders(&payload)?;
     let receiver_address = payload.receiver_address.clone();
     let amount = payload.amount.clone();
+    let primary_sender = senders[0].clone();
 
-    // Building does blocking network RPC calls (cell collection, genesis
-    // block lookup), so run it on the blocking thread pool.
-    let tx = tokio::task::spawn_blocking(move || {
-        build_unsigned_transaction(&sender_address, &receiver_address, &amount)
+    let (tx, plan) = tokio::task::spawn_blocking(move || {
+        build_unsigned_transaction_multi(&senders, &receiver_address, &amount)
     })
     .await
     .map_err(|e| {
@@ -87,10 +124,19 @@ pub async fn build_transaction(
         )
     })?;
 
+    let signers = plan
+        .into_iter()
+        .map(|(witness_index, address)| BuildTransactionSigner {
+            witness_index: witness_index as u32,
+            address,
+        })
+        .collect();
+
     Ok(Json(BuildTransactionResponse {
         transaction,
-        sender_address: payload.sender_address,
+        sender_address: primary_sender,
         receiver_address: payload.receiver_address,
         amount: payload.amount,
+        signers,
     }))
 }

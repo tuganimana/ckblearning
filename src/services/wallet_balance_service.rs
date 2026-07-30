@@ -13,6 +13,11 @@ pub struct WalletBalanceRequest {
     /// Account-level extended public key (BIP-32 xpub for `m/44'/309'/0'`).
     /// Never send the mnemonic or an extended private key here.
     pub account_xpub: String,
+    /// When set, scan exactly addresses `0..first_n` (capped by `MAX_SCAN`)
+    /// and return — no gap-limit early stop. When omitted, scan in batches
+    /// of `GAP_LIMIT` until a fully empty batch (or `MAX_SCAN`).
+    #[serde(default)]
+    pub first_n: Option<u32>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -46,13 +51,22 @@ pub async fn get_wallet_balance(
     Json(payload): Json<WalletBalanceRequest>,
 ) -> Result<Json<WalletBalanceResponse>, (StatusCode, String)> {
     let account_xpub = Arc::new(payload.account_xpub);
+    let fixed_limit = payload.first_n.map(|n| n.min(MAX_SCAN));
 
     let mut balances = Vec::new();
     let mut total_balance = 0u64;
     let mut scanned = 0u32;
 
     while scanned < MAX_SCAN {
-        let batch_end = (scanned + GAP_LIMIT).min(MAX_SCAN);
+        let batch_end = match fixed_limit {
+            Some(limit) => {
+                if scanned >= limit {
+                    break;
+                }
+                (scanned + GAP_LIMIT).min(limit)
+            }
+            None => (scanned + GAP_LIMIT).min(MAX_SCAN),
+        };
 
         let mut handles = Vec::with_capacity((batch_end - scanned) as usize);
         for index in scanned..batch_end {
@@ -84,7 +98,9 @@ pub async fn get_wallet_balance(
 
         scanned = batch_end;
 
-        if !batch_had_funds {
+        // Gap-limit mode: stop after a fully empty batch.
+        // Fixed first-N mode: keep going until `first_n` addresses are scanned.
+        if fixed_limit.is_none() && !batch_had_funds {
             break;
         }
     }

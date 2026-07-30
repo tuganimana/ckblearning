@@ -1,6 +1,11 @@
 use std::env;
+use std::time::Duration;
 
 use ckb_sdk::{rpc::CkbRpcClient, types::NetworkType};
+
+/// Per-RPC HTTP timeout. Fail fast so a slow public node can't pin workers
+/// for the full request timeout.
+const RPC_TIMEOUT: Duration = Duration::from_secs(12);
 
 /// Active chain from `CKB_NETWORK` in `.env`: `testnet` | `mainnet` | `devnet`.
 pub fn network() -> String {
@@ -34,5 +39,9 @@ pub fn network_type() -> NetworkType {
 }
 
 pub fn connect_client() -> CkbRpcClient {
-    CkbRpcClient::new(rpc_url().as_str())
+    let url = rpc_url();
+    CkbRpcClient::new_with_timeout(url.as_str(), RPC_TIMEOUT).unwrap_or_else(|e| {
+        eprintln!("CKB RPC client timeout setup failed ({e:#}); falling back to default client");
+        CkbRpcClient::new(url.as_str())
+    })
 }

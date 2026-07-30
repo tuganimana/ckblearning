@@ -51,9 +51,20 @@ pub async fn get_wallet_balance_dev(
     let mut balances = Vec::new();
     let mut total_balance = 0u64;
     let mut scanned = 0u32;
+    let mut last_funded: Option<u32> = None;
 
     while scanned < MAX_SCAN {
-        let batch_end = (scanned + GAP_LIMIT).min(MAX_SCAN);
+        let stop_after = last_funded
+            .map(|i| i.saturating_add(GAP_LIMIT))
+            .unwrap_or(GAP_LIMIT.saturating_sub(1));
+        if scanned > stop_after {
+            break;
+        }
+
+        let batch_end = (scanned + GAP_LIMIT).min(stop_after + 1).min(MAX_SCAN);
+        if batch_end <= scanned {
+            break;
+        }
 
         let mut handles = Vec::with_capacity((batch_end - scanned) as usize);
         for index in scanned..batch_end {
@@ -63,7 +74,6 @@ pub async fn get_wallet_balance_dev(
             handles.push((index, wallet.address.to_string(), tokio::spawn(get_balance_async(address))));
         }
 
-        let mut batch_had_funds = false;
         for (index, address, handle) in handles {
             let balance = handle.await.map_err(|e| {
                 (
@@ -73,7 +83,7 @@ pub async fn get_wallet_balance_dev(
             })??;
 
             if balance > 0 {
-                batch_had_funds = true;
+                last_funded = Some(index);
             }
 
             total_balance += balance;
@@ -85,10 +95,6 @@ pub async fn get_wallet_balance_dev(
         }
 
         scanned = batch_end;
-
-        if !batch_had_funds {
-            break;
-        }
     }
 
     Ok(Json(DevWalletBalanceResponse {

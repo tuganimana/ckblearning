@@ -4,6 +4,7 @@ use axum::{extract::Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use crate::config::balance_cache;
 use crate::config::wallet_scan::{get_balance_async, GAP_LIMIT, MAX_SCAN};
 
 use super::xpub_wallet::derive_address_from_xpub;
@@ -20,17 +21,24 @@ pub struct WalletBalanceRequest {
     pub first_n: Option<u32>,
 }
 
-#[derive(Serialize, ToSchema)]
+#[derive(Serialize, Deserialize, ToSchema, Clone)]
 pub struct WalletAddressBalance {
     pub index: u32,
     pub address: String,
     pub balance: u64,
 }
 
-#[derive(Serialize, ToSchema)]
+#[derive(Serialize, Deserialize, ToSchema, Clone)]
 pub struct WalletBalanceResponse {
     pub balances: Vec<WalletAddressBalance>,
     pub total_balance: u64,
+}
+
+fn wallet_cache_key(account_xpub: &str, first_n: Option<u32>) -> String {
+    match first_n {
+        Some(n) => format!("{account_xpub}|n={n}"),
+        None => format!("{account_xpub}|gap"),
+    }
 }
 
 /// Totals the balance across every address derived from an **account
@@ -49,6 +57,13 @@ pub struct WalletBalanceResponse {
 pub async fn get_wallet_balance(
     Json(payload): Json<WalletBalanceRequest>,
 ) -> Result<Json<WalletBalanceResponse>, (StatusCode, String)> {
+    let cache_key = wallet_cache_key(&payload.account_xpub, payload.first_n);
+    if let Some(cached) = balance_cache::get_wallet(&cache_key) {
+        if let Ok(body) = serde_json::from_str::<WalletBalanceResponse>(&cached) {
+            return Ok(Json(body));
+        }
+    }
+
     let account_xpub = Arc::new(payload.account_xpub);
     let fixed_limit = payload.first_n.map(|n| n.min(MAX_SCAN));
 
@@ -106,8 +121,14 @@ pub async fn get_wallet_balance(
         scanned = batch_end;
     }
 
-    Ok(Json(WalletBalanceResponse {
+    let response = WalletBalanceResponse {
         balances,
         total_balance,
-    }))
+    };
+
+    if let Ok(payload) = serde_json::to_string(&response) {
+        balance_cache::put_wallet(cache_key, payload);
+    }
+
+    Ok(Json(response))
 }

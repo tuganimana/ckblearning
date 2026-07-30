@@ -5,9 +5,13 @@ use super::balance::get_balance;
 
 /// How many consecutive unused addresses we tolerate past the last funded
 /// index before stopping a gap-limit scan (BIP-44 style).
-pub const GAP_LIMIT: u32 = 20;
+///
+/// 10 is enough for typical receive patterns and halves the empty-wallet
+/// cold-scan cost vs the classic 20.
+pub const GAP_LIMIT: u32 = 10;
 
 pub const MAX_SCAN: u32 = 10_000;
+
 pub async fn get_balance_async(address: Address) -> Result<u64, (StatusCode, String)> {
     tokio::task::spawn_blocking(move || get_balance(&address))
         .await

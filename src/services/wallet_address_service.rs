@@ -11,7 +11,18 @@ async fn find_next_index(account_xpub: &str) -> Result<u32, (StatusCode, String)
     let mut scanned = 0u32;
 
     while scanned < MAX_SCAN {
-        let batch_end = (scanned + GAP_LIMIT).min(MAX_SCAN);
+        // BIP-44: stop after last_funded + GAP_LIMIT (or first GAP empties).
+        let stop_after = last_used_index
+            .map(|i| i.saturating_add(GAP_LIMIT))
+            .unwrap_or(GAP_LIMIT.saturating_sub(1));
+        if scanned > stop_after {
+            break;
+        }
+
+        let batch_end = (scanned + GAP_LIMIT).min(stop_after + 1).min(MAX_SCAN);
+        if batch_end <= scanned {
+            break;
+        }
 
         let mut handles = Vec::with_capacity((batch_end - scanned) as usize);
         for index in scanned..batch_end {
@@ -20,7 +31,6 @@ async fn find_next_index(account_xpub: &str) -> Result<u32, (StatusCode, String)
             handles.push((index, tokio::spawn(get_balance_async(address))));
         }
 
-        let mut batch_had_funds = false;
         for (index, handle) in handles {
             let balance = handle.await.map_err(|e| {
                 (
@@ -30,16 +40,11 @@ async fn find_next_index(account_xpub: &str) -> Result<u32, (StatusCode, String)
             })??;
 
             if balance > 0 {
-                batch_had_funds = true;
                 last_used_index = Some(index);
             }
         }
 
         scanned = batch_end;
-
-        if !batch_had_funds {
-            break;
-        }
     }
 
     Ok(last_used_index.map(|i| i + 1).unwrap_or(0))

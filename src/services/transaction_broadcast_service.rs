@@ -53,8 +53,10 @@ pub async fn broadcast(
         eprintln!("transaction/broadcast failed: {e:#}");
         (
             StatusCode::BAD_REQUEST,
-            "Failed to broadcast the transaction: it may be unsigned, invalid, or already spent."
-                .to_string(),
+            format!(
+                "Failed to broadcast the transaction: {e}. \
+                 It may be unsigned, invalid, or already spent."
+            ),
         )
     })?;
 

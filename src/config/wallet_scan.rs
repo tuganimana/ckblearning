@@ -3,7 +3,8 @@ use ckb_sdk::Address;
 
 use super::balance::get_balance;
 
-/// How many consecutive unused addresses we tolerate before assuming the
+/// How many consecutive unused addresses we tolerate past the last funded
+/// index before stopping a gap-limit scan (BIP-44 style).
 pub const GAP_LIMIT: u32 = 20;
 
 pub const MAX_SCAN: u32 = 10_000;

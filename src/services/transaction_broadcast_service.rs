@@ -2,6 +2,7 @@ use axum::{extract::Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use crate::config::balance_cache;
 use crate::config::create_transaction::{broadcast_transaction, parse_signed_transaction};
 
 #[derive(Deserialize, ToSchema)]
@@ -56,6 +57,9 @@ pub async fn broadcast(
                 .to_string(),
         )
     })?;
+
+    // Next balance reads must reflect the spend/receive.
+    balance_cache::invalidate_all();
 
     Ok(Json(BroadcastTransactionResponse {
         tx_hash: tx_hash.to_string(),

@@ -20,18 +20,16 @@ pub mod address_controller;
 /// bytes at most. Cap well above that to block abusive oversized payloads.
 const MAX_BODY_BYTES: usize = 64 * 1024;
 
-/// Some endpoints (`/generate-address`, `/balance/wallet`,
-/// `/transaction/send`) can legitimately scan thousands of derived
-/// addresses; give them room, but don't let a stuck connection hold a
-/// worker forever.
-const REQUEST_TIMEOUT_SECS: u64 = 60;
+/// Some endpoints (`/wallet/balance`) can scan many derived addresses;
+/// give them room, but don't let a stuck connection hold a worker forever.
+const REQUEST_TIMEOUT_SECS: u64 = 45;
 
-/// Requests-per-second and burst allowance, per client IP, for the wallet
-/// endpoints. These are cheap to call but each one can fan out into many
-/// RPC calls to the CKB node/indexer, so they need to be rate limited to
-/// avoid one caller exhausting the node connection or running up costs.
-const RATE_LIMIT_PER_SECOND: u64 = 2;
-const RATE_LIMIT_BURST_SIZE: u32 = 10;
+/// Per-client-IP rate limit. Kept high enough that the Flutter app + Kaze
+/// Python API (balance + history in parallel, plus deposit poller) are not
+/// queued behind a 2/s ceiling — that queueing was the dominant multi-second
+/// latency on warm endpoints.
+const RATE_LIMIT_PER_SECOND: u64 = 20;
+const RATE_LIMIT_BURST_SIZE: u32 = 40;
 
 /// Restricts cross-origin browser access. Set `CORS_ALLOWED_ORIGINS` (a
 /// comma-separated list, e.g. `https://app.example.com,https://example.com`)

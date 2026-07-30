@@ -34,9 +34,5 @@ pub fn network_type() -> NetworkType {
 }
 
 pub fn connect_client() -> CkbRpcClient {
-    let network = network();
-    let url = rpc_url();
-    let ckb_client = CkbRpcClient::new(url.as_str());
-    println!("Connected to CKB {} network", network);
-    ckb_client
+    CkbRpcClient::new(rpc_url().as_str())
 }

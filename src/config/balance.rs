@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use anyhow::{anyhow, Result};
@@ -11,9 +13,17 @@ use ckb_sdk::{
 };
 use ckb_types::{prelude::*, H256};
 
-use super::client;
+use super::{balance_cache, client};
+
+/// Cap concurrent `get_transaction` workers so we don't stampede the node.
+const TX_RESOLVE_CONCURRENCY: usize = 8;
 
 pub fn get_balance(address: &Address) -> Result<u64> {
+    let key = address.to_string();
+    if let Some(cached) = balance_cache::get(&key) {
+        return Ok(cached);
+    }
+
     let url = client::rpc_url();
     let mut collector = DefaultCellCollector::new(url.as_str());
 
@@ -28,6 +38,7 @@ pub fn get_balance(address: &Address) -> Result<u64> {
         })
         .sum();
 
+    balance_cache::put(key, balance);
     Ok(balance)
 }
 
@@ -69,7 +80,8 @@ pub fn list_transactions(address: &Address, limit: u32) -> Result<Vec<Transactio
     };
 
     // Fetch extra cell rows so netting still yields ~`limit` transactions.
-    let fetch_limit = limit.saturating_mul(3).clamp(limit, 100);
+    // Keep the multiplier modest — each cell can cost 1–2 get_transaction RPCs.
+    let fetch_limit = limit.saturating_mul(2).clamp(limit, 40);
 
     let page = ckb_client
         .get_transactions(search_key, Order::Desc, fetch_limit.into(), None)
@@ -79,55 +91,77 @@ pub fn list_transactions(address: &Address, limit: u32) -> Result<Vec<Transactio
         .objects
         .into_iter()
         .filter_map(|tx| match tx {
-            Tx::Ungrouped(tx) => Some((tx.tx_hash, tx.block_number.value(), tx.io_index.value(), tx.io_type)),
-            // Shouldn't happen since we asked for group_by_transaction: Some(false).
+            Tx::Ungrouped(tx) => Some((
+                tx.tx_hash,
+                tx.block_number.value(),
+                tx.io_index.value(),
+                tx.io_type,
+            )),
             Tx::Grouped(_) => None,
         })
         .collect();
 
-    // Working out the amount takes 1-2 extra RPC round trips per entry (see
-    // `resolve_amount`), so resolve them concurrently on plain OS threads
-    // rather than one at a time.
-    //
-    // Important: skip individual amount failures instead of failing the whole
-    // request with HTTP 500 — one bad/missing tx used to blank wallet history.
-    let cell_records = thread::scope(|scope| {
-        entries
-            .into_iter()
-            .map(|(tx_hash, block_number, io_index, io_type)| {
-                scope.spawn(move || -> Option<TransactionRecord> {
-                    match resolve_amount(&tx_hash, io_index, &io_type) {
-                        Ok(amount) => Some(TransactionRecord {
-                            tx_hash,
-                            block_number,
-                            direction: match io_type {
-                                CellType::Output => "received",
-                                CellType::Input => "sent",
-                            },
-                            amount,
-                        }),
-                        Err(e) => {
-                            eprintln!(
-                                "skipping tx amount lookup {tx_hash}/{io_index:?}: {e:#}"
-                            );
-                            None
-                        }
-                    }
-                })
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .filter_map(|handle| handle.join().ok().flatten())
-            .collect::<Vec<_>>()
-    });
+    // Share output capacities across cell resolutions in this request.
+    let capacity_cache: Arc<Mutex<HashMap<(H256, u32), u64>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 
+    let cell_records = resolve_cells_bounded(entries, capacity_cache);
     Ok(net_transactions_by_hash(cell_records, limit))
 }
 
-/// Collapse per-cell rows into one wallet-facing entry per `tx_hash`.
-fn net_transactions_by_hash(cell_records: Vec<TransactionRecord>, limit: u32) -> Vec<TransactionRecord> {
-    use std::collections::HashMap;
+fn resolve_cells_bounded(
+    entries: Vec<(H256, u64, u32, CellType)>,
+    capacity_cache: Arc<Mutex<HashMap<(H256, u32), u64>>>,
+) -> Vec<TransactionRecord> {
+    let mut cell_records = Vec::with_capacity(entries.len());
+    for chunk in entries.chunks(TX_RESOLVE_CONCURRENCY) {
+        thread::scope(|scope| {
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|(tx_hash, block_number, io_index, io_type)| {
+                    let tx_hash = tx_hash.clone();
+                    let block_number = *block_number;
+                    let io_index = *io_index;
+                    let io_type = io_type.clone();
+                    let capacity_cache = Arc::clone(&capacity_cache);
+                    scope.spawn(move || -> Option<TransactionRecord> {
+                        match resolve_amount_cached(&tx_hash, io_index, &io_type, &capacity_cache)
+                        {
+                            Ok(amount) => Some(TransactionRecord {
+                                tx_hash,
+                                block_number,
+                                direction: match io_type {
+                                    CellType::Output => "received",
+                                    CellType::Input => "sent",
+                                },
+                                amount,
+                            }),
+                            Err(e) => {
+                                eprintln!(
+                                    "skipping tx amount lookup {tx_hash}/{io_index:?}: {e:#}"
+                                );
+                                None
+                            }
+                        }
+                    })
+                })
+                .collect();
 
+            for handle in handles {
+                if let Ok(Some(record)) = handle.join() {
+                    cell_records.push(record);
+                }
+            }
+        });
+    }
+    cell_records
+}
+
+/// Collapse per-cell rows into one wallet-facing entry per `tx_hash`.
+fn net_transactions_by_hash(
+    cell_records: Vec<TransactionRecord>,
+    limit: u32,
+) -> Vec<TransactionRecord> {
     let mut order: Vec<H256> = Vec::new();
     let mut received: HashMap<H256, u64> = HashMap::new();
     let mut sent: HashMap<H256, u64> = HashMap::new();
@@ -173,14 +207,14 @@ fn net_transactions_by_hash(cell_records: Vec<TransactionRecord>, limit: u32) ->
     netted
 }
 
-/// Resolves the capacity (in Shannons) of the cell referenced by
-/// `tx_hash`/`io_index`. For an output cell that's simply the created cell's
-/// own capacity; for an input cell it's the capacity of the earlier output
-/// it spends, since a spent cell is no longer "live" and can't be looked up
-/// directly.
-fn resolve_amount(tx_hash: &H256, io_index: u32, io_type: &CellType) -> Result<u64> {
+fn resolve_amount_cached(
+    tx_hash: &H256,
+    io_index: u32,
+    io_type: &CellType,
+    capacity_cache: &Mutex<HashMap<(H256, u32), u64>>,
+) -> Result<u64> {
     match io_type {
-        CellType::Output => get_output_capacity(tx_hash, io_index),
+        CellType::Output => get_output_capacity_cached(tx_hash, io_index, capacity_cache),
         CellType::Input => {
             let ckb_client = client::connect_client();
             let resp = ckb_client
@@ -201,9 +235,36 @@ fn resolve_amount(tx_hash: &H256, io_index: u32, io_type: &CellType) -> Result<u
                 .ok_or_else(|| anyhow!("Input index {io_index} out of range for tx {tx_hash}"))?;
 
             let previous_output = &input.previous_output;
-            get_output_capacity(&previous_output.tx_hash, previous_output.index.value())
+            get_output_capacity_cached(
+                &previous_output.tx_hash,
+                previous_output.index.value(),
+                capacity_cache,
+            )
         }
     }
+}
+
+fn get_output_capacity_cached(
+    tx_hash: &H256,
+    index: u32,
+    capacity_cache: &Mutex<HashMap<(H256, u32), u64>>,
+) -> Result<u64> {
+    let key = (tx_hash.clone(), index);
+    if let Some(hit) = capacity_cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .copied()
+    {
+        return Ok(hit);
+    }
+
+    let capacity = get_output_capacity(tx_hash, index)?;
+    capacity_cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, capacity);
+    Ok(capacity)
 }
 
 /// Fetches `tx_hash` and returns the capacity of its output at `index`.

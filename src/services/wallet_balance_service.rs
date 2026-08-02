@@ -11,12 +11,7 @@ use super::xpub_wallet::derive_address_from_xpub;
 
 #[derive(Deserialize, ToSchema)]
 pub struct WalletBalanceRequest {
-    /// Account-level extended public key (BIP-32 xpub for `m/44'/309'/0'`).
-    /// Never send the mnemonic or an extended private key here.
     pub account_xpub: String,
-    /// When set, scan exactly addresses `0..first_n` (capped by `MAX_SCAN`)
-    /// and return — no gap-limit early stop. When omitted, scan in batches
-    /// of `GAP_LIMIT` until `last_funded + GAP_LIMIT` (BIP-44 style).
     #[serde(default)]
     pub first_n: Option<u32>,
 }
@@ -41,9 +36,6 @@ fn wallet_cache_key(account_xpub: &str, first_n: Option<u32>) -> String {
     }
 }
 
-/// Totals the balance across every address derived from an **account
-/// xpub**, using a BIP-44 gap-limit scan — but never needs a private key,
-/// since address derivation from an xpub is public-key math only.
 #[utoipa::path(
     post,
     path = "/wallet/balance",

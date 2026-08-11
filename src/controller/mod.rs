@@ -79,6 +79,7 @@ fn cors_layer() -> CorsLayer {
         crate::services::fiber_swap_service::ckb_to_lightning,
         crate::services::fiber_swap_service::btc_to_ckb,
         crate::services::fiber_swap_service::get_cch_order,
+        crate::services::fiber_swap_service::pay_lightning,
         // Dev/testing-only -- disabled unless ALLOW_DEV_KEY_ENDPOINTS=true.
         crate::services::generate_mnemonic_service::generate_mnemonic,
         crate::services::generate_address_service::generate_address,
@@ -113,6 +114,9 @@ fn cors_layer() -> CorsLayer {
         crate::services::fiber_payment_service::SendFiberPaymentResponse,
         crate::services::fiber_payment_service::GetFiberPaymentRequest,
         crate::services::fiber_swap_service::CkbToLightningRequest,
+        crate::services::fiber_swap_service::PayLightningRequest,
+        crate::services::fiber_swap_service::PayLightningResponse,
+        crate::services::fiber_swap_service::FiberPaymentSummary,
         crate::services::fiber_swap_service::BtcToCkbRequest,
         crate::services::fiber_swap_service::GetCchOrderRequest,
         crate::services::fiber_swap_service::CchOrderResponse,

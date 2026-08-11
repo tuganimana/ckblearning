@@ -66,6 +66,10 @@ pub fn address_router() -> Router {
             "/fiber/swap/order",
             post(fiber_swap_service::get_cch_order),
         )
+        .route(
+            "/fiber/swap/pay-lightning",
+            post(fiber_swap_service::pay_lightning),
+        )
         // -- Dev/testing-only: disabled unless ALLOW_DEV_KEY_ENDPOINTS=true --
         .route(
             "/dev/generate-mnemonic",

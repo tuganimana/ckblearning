@@ -3,7 +3,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use utoipa::ToSchema;
 
-use crate::config::fiber_client::{fiber_currency, fiber_rpc_call, object_params};
+use crate::config::fiber_client::{
+    fiber_currency, fiber_rpc_call, object_params, to_hex_u128_opt,
+};
 
 #[derive(Deserialize, ToSchema)]
 pub struct CkbToLightningRequest {
@@ -12,6 +14,61 @@ pub struct CkbToLightningRequest {
     /// Fiber currency for the generated CKB-side invoice. Defaults from `CKB_NETWORK`.
     #[serde(default)]
     pub currency: Option<String>,
+}
+
+/// One-shot: create a CCH CKB→Lightning order and pay the Fiber invoice from
+/// the connected Fiber node's channel balance.
+///
+/// This does **not** spend a user's on-chain `/wallet/balance` CKB. It spends
+/// Fiber Network funds held by the node (CCH typically uses wrapped BTC UDT
+/// at ~1:1 sats). Requires Fiber CCH + LND to be enabled.
+#[derive(Deserialize, ToSchema)]
+pub struct PayLightningRequest {
+    /// Bitcoin Lightning BOLT11 invoice to settle.
+    pub btc_pay_req: String,
+    /// Fiber currency for the CCH Fiber invoice. Defaults from `CKB_NETWORK`.
+    #[serde(default)]
+    pub currency: Option<String>,
+    /// When true (default), immediately `send_payment` on the Fiber
+    /// `incoming_invoice`. When false, only creates the CCH order (same as
+    /// `/fiber/swap/ckb-to-lightning`).
+    #[serde(default = "default_true")]
+    pub auto_pay: bool,
+    /// Dry-run the Fiber payment (route/fee estimate, no send).
+    #[serde(default)]
+    pub dry_run: Option<bool>,
+    /// Max Fiber routing fee in shannons. Decimal or `0x` hex.
+    #[serde(default)]
+    pub max_fee_amount: Option<String>,
+    /// After paying, poll CCH order status a few times for settlement.
+    #[serde(default)]
+    pub wait_for_settlement: Option<bool>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct FiberPaymentSummary {
+    pub payment_hash: String,
+    /// Created | Inflight | Success | Failed
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fee: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct PayLightningResponse {
+    /// CCH order (amounts, Fiber invoice, Lightning status).
+    pub order: CchOrderResponse,
+    /// Fiber-side payment result when `auto_pay` ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fiber_payment: Option<FiberPaymentSummary>,
+    /// Human-readable next step / outcome for clients (Kaze UI).
+    pub message: String,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -71,36 +128,103 @@ pub struct CchOrderResponse {
 pub async fn ckb_to_lightning(
     Json(payload): Json<CkbToLightningRequest>,
 ) -> Result<Json<CchOrderResponse>, (StatusCode, String)> {
-    let btc_pay_req = payload.btc_pay_req.trim();
-    if btc_pay_req.is_empty() {
+    let order = create_ckb_to_lightning_order(&payload.btc_pay_req, payload.currency.as_deref()).await?;
+    Ok(Json(order))
+}
+
+/// Pay a Lightning invoice in one call: CCH `send_btc` + Fiber `send_payment`.
+///
+/// Existing step-by-step endpoints (`/fiber/swap/ckb-to-lightning` then
+/// `/fiber/payment/send`) remain unchanged for clients that prefer them.
+#[utoipa::path(
+    post,
+    path = "/fiber/swap/pay-lightning",
+    request_body = PayLightningRequest,
+    responses(
+        (status = 200, description = "CCH order created; Fiber payment started when auto_pay", body = PayLightningResponse),
+        (status = 400, description = "Invalid Lightning invoice"),
+        (status = 503, description = "Fiber RPC not configured"),
+        (status = 502, description = "Fiber RPC / CCH / payment error")
+    ),
+    tag = "fiber"
+)]
+pub async fn pay_lightning(
+    Json(payload): Json<PayLightningRequest>,
+) -> Result<Json<PayLightningResponse>, (StatusCode, String)> {
+    let mut order =
+        create_ckb_to_lightning_order(&payload.btc_pay_req, payload.currency.as_deref()).await?;
+
+    if !payload.auto_pay {
+        return Ok(Json(PayLightningResponse {
+            message: "CCH order created. Pay order.incoming_invoice via /fiber/payment/send to settle Lightning."
+                .to_string(),
+            order,
+            fiber_payment: None,
+        }));
+    }
+
+    if order.incoming_invoice.trim().is_empty() {
         return Err((
-            StatusCode::BAD_REQUEST,
-            "btc_pay_req is required".to_string(),
+            StatusCode::BAD_GATEWAY,
+            "CCH order missing incoming_invoice; cannot auto-pay".to_string(),
         ));
     }
-    if !looks_like_bolt11(btc_pay_req) {
+    if !order.incoming_network.is_empty() && order.incoming_network != "Fiber" {
         return Err((
-            StatusCode::BAD_REQUEST,
-            "btc_pay_req does not look like a BOLT11 Lightning invoice".to_string(),
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "expected Fiber incoming_invoice for CKB→Lightning, got {}",
+                order.incoming_network
+            ),
         ));
     }
 
-    let currency = payload
-        .currency
-        .clone()
-        .filter(|c| !c.trim().is_empty())
-        .unwrap_or_else(fiber_currency);
-
-    let result: Value = fiber_rpc_call(
-        "send_btc",
-        object_params(json!({
-            "btc_pay_req": btc_pay_req,
-            "currency": currency,
-        })),
+    let fiber_payment = send_fiber_invoice_payment(
+        &order.incoming_invoice,
+        payload.dry_run,
+        payload.max_fee_amount.as_ref(),
     )
     .await?;
 
-    Ok(Json(map_cch_order(result)))
+    if payload.wait_for_settlement.unwrap_or(false) && !payload.dry_run.unwrap_or(false) {
+        order = poll_cch_order_briefly(&order.payment_hash).await.unwrap_or(order);
+    }
+
+    let message = match (
+        fiber_payment.status.as_str(),
+        order.status.as_str(),
+        payload.dry_run.unwrap_or(false),
+    ) {
+        (_, _, true) => {
+            "Dry-run complete: CCH order created and Fiber payment route estimated (not sent)."
+                .to_string()
+        }
+        ("Success", "Success", _) | ("Success", "OutgoingSuccess", _) => {
+            "Lightning invoice settled via Fiber CCH.".to_string()
+        }
+        ("Success", _, _) | ("Inflight", _, _) | ("Created", _, _) => format!(
+            "Fiber payment {}. Poll /fiber/swap/order with payment_hash until Lightning settles (current CCH status: {}).",
+            fiber_payment.status, order.status
+        ),
+        ("Failed", _, _) => format!(
+            "Fiber payment failed: {}. CCH order status: {}.",
+            fiber_payment
+                .failed_error
+                .as_deref()
+                .unwrap_or("unknown error"),
+            order.status
+        ),
+        _ => format!(
+            "Fiber payment {}; CCH status {}. Poll /fiber/swap/order with payment_hash.",
+            fiber_payment.status, order.status
+        ),
+    };
+
+    Ok(Json(PayLightningResponse {
+        order,
+        fiber_payment: Some(fiber_payment),
+        message,
+    }))
 }
 
 /// Swap Bitcoin Lightning → CKB (Fiber): receive BTC LN payment into Fiber.
@@ -178,6 +302,110 @@ pub async fn get_cch_order(
     .await?;
 
     Ok(Json(map_cch_order(result)))
+}
+
+async fn create_ckb_to_lightning_order(
+    btc_pay_req: &str,
+    currency: Option<&str>,
+) -> Result<CchOrderResponse, (StatusCode, String)> {
+    let btc_pay_req = btc_pay_req.trim();
+    if btc_pay_req.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "btc_pay_req is required".to_string(),
+        ));
+    }
+    if !looks_like_bolt11(btc_pay_req) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "btc_pay_req does not look like a BOLT11 Lightning invoice".to_string(),
+        ));
+    }
+
+    let currency = currency
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(fiber_currency);
+
+    let result: Value = fiber_rpc_call(
+        "send_btc",
+        object_params(json!({
+            "btc_pay_req": btc_pay_req,
+            "currency": currency,
+        })),
+    )
+    .await?;
+
+    Ok(map_cch_order(result))
+}
+
+async fn send_fiber_invoice_payment(
+    invoice: &str,
+    dry_run: Option<bool>,
+    max_fee_amount: Option<&String>,
+) -> Result<FiberPaymentSummary, (StatusCode, String)> {
+    let mut params = json!({ "invoice": invoice });
+    let obj = params.as_object_mut().expect("object");
+
+    if let Some(dry_run) = dry_run {
+        obj.insert("dry_run".into(), json!(dry_run));
+    }
+    let max_fee = max_fee_amount.cloned();
+    if let Some(max_fee_amount) = to_hex_u128_opt(&max_fee)? {
+        obj.insert("max_fee_amount".into(), json!(max_fee_amount));
+    }
+
+    let result: Value = fiber_rpc_call("send_payment", object_params(params)).await?;
+    Ok(FiberPaymentSummary {
+        payment_hash: result
+            .get("payment_hash")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        status: result
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        failed_error: result
+            .get("failed_error")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        fee: result.get("fee").map(value_to_owned_string),
+    })
+}
+
+/// Short poll so one-shot callers can often return Success without a second request.
+async fn poll_cch_order_briefly(payment_hash: &str) -> Result<CchOrderResponse, (StatusCode, String)> {
+    const ATTEMPTS: usize = 5;
+    const DELAY_MS: u64 = 800;
+
+    let mut last = None;
+    for _ in 0..ATTEMPTS {
+        let result: Value = fiber_rpc_call(
+            "get_cch_order",
+            object_params(json!({ "payment_hash": payment_hash })),
+        )
+        .await?;
+        let order = map_cch_order(result);
+        let done = matches!(
+            order.status.as_str(),
+            "Success" | "OutgoingSuccess" | "Failed"
+        );
+        last = Some(order);
+        if done {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(DELAY_MS)).await;
+    }
+
+    last.ok_or_else(|| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "failed to refresh CCH order status".to_string(),
+        )
+    })
 }
 
 fn map_cch_order(result: Value) -> CchOrderResponse {

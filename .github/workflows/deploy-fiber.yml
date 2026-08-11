@@ -1,4 +1,4 @@
-# Deploy Fiber Network Node (FNN) to the Droplet.
+# Deploy Fiber Network Node (FNN) + LND (CCH payer) to the Droplet.
 # New workflow only — does NOT modify .github/workflows/deploy.yml.
 #
 # Same pattern as the app deploy: SSH into the Droplet, pull image,
@@ -15,12 +15,23 @@
 #
 # Optional:
 #   FIBER_ANNOUNCED_ADDR — e.g. /ip4/YOUR.PUBLIC.IP/tcp/8228
+#   FIBER_LND_WALLET_PASSWORD — LND wallet unlock password (defaults to
+#                              FIBER_SECRET_KEY_PASSWORD if unset)
 #
 # Networking:
-#   Fiber uses --network host so rpc.listening_addr 172.17.0.1:8227 (private)
-#   works without biscuit auth. P2P still binds 0.0.0.0:8228 on the host.
+#   Fiber + LND use --network host so:
+#     - Fiber RPC 172.17.0.1:8227 (private, no biscuit)
+#     - LND gRPC 127.0.0.1:10009 (CCH)
+#     - LND P2P :9735
 #   App reaches Fiber via:
 #     FIBER_RPC_URL=http://172.17.0.1:8227
+#
+# After this deploy, /fiber/swap/pay-lightning works when:
+#   1. CCH started (Fiber logs: "cch started successfully")
+#   2. LND has outbound Lightning liquidity (channels + sats)
+#   3. Fiber node has cWBTC channel liquidity to pay the CCH Fiber invoice
+#
+# Settlement asset is testnet cWBTC (wrapped BTC UDT), not native CKB capacity.
 
 name: Deploy Fiber Node
 
@@ -37,62 +48,81 @@ on:
         description: "nervos/fiber image tag"
         required: false
         default: "0.9.0-rc7"
+      lnd_image_tag:
+        description: "lightninglabs/lnd image tag"
+        required: false
+        default: "v0.18.5-beta"
 
 env:
   FIBER_IMAGE: nervos/fiber
   FIBER_IMAGE_TAG: ${{ github.event.inputs.fiber_image_tag || '0.9.0-rc7' }}
+  LND_IMAGE: lightninglabs/lnd
+  LND_IMAGE_TAG: ${{ github.event.inputs.lnd_image_tag || 'v0.18.5-beta' }}
   FIBER_CONTAINER: fiber-node
+  LND_CONTAINER: fiber-lnd
   APP_CONTAINER: kaze-ckb
   FIBER_P2P_PORT: "8228"
   FIBER_RPC_PORT: "8227"
+  LND_P2P_PORT: "9735"
   APP_PORT: "5050"
   # Default docker0 bridge gateway — reachable from app container after deploy.yml
   FIBER_RPC_URL_FOR_APP: "http://172.17.0.1:8227"
 
 jobs:
   deploy-fiber:
-    name: Deploy Fiber to Droplet
+    name: Deploy Fiber + LND to Droplet
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Copy Fiber config to Droplet
+      - name: Copy Fiber + LND config to Droplet
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.DROPLET_HOST }}
           username: ${{ secrets.DROPLET_USERNAME }}
           password: ${{ secrets.DROPLET_PASSWORD }}
-          source: "deploy/fiber/config.yml"
+          source: "deploy/fiber/config.yml,deploy/fiber/lnd.conf"
           target: "~/fiber-node/"
           strip_components: 2
 
-      - name: Deploy Fiber via SSH
+      - name: Deploy Fiber + LND via SSH
         uses: appleboy/ssh-action@v1.0.3
         env:
           DROPLET_PASSWORD: ${{ secrets.DROPLET_PASSWORD }}
           FIBER_SECRET_KEY_PASSWORD: ${{ secrets.FIBER_SECRET_KEY_PASSWORD }}
+          FIBER_LND_WALLET_PASSWORD: ${{ secrets.FIBER_LND_WALLET_PASSWORD }}
           FIBER_CKB_KEY: ${{ secrets.FIBER_CKB_KEY }}
           FIBER_ANNOUNCED_ADDR: ${{ secrets.FIBER_ANNOUNCED_ADDR }}
           FIBER_IMAGE: ${{ env.FIBER_IMAGE }}
           FIBER_IMAGE_TAG: ${{ env.FIBER_IMAGE_TAG }}
+          LND_IMAGE: ${{ env.LND_IMAGE }}
+          LND_IMAGE_TAG: ${{ env.LND_IMAGE_TAG }}
           FIBER_CONTAINER: ${{ env.FIBER_CONTAINER }}
+          LND_CONTAINER: ${{ env.LND_CONTAINER }}
           APP_CONTAINER: ${{ env.APP_CONTAINER }}
           FIBER_P2P_PORT: ${{ env.FIBER_P2P_PORT }}
           FIBER_RPC_PORT: ${{ env.FIBER_RPC_PORT }}
+          LND_P2P_PORT: ${{ env.LND_P2P_PORT }}
           APP_PORT: ${{ env.APP_PORT }}
           FIBER_RPC_URL_FOR_APP: ${{ env.FIBER_RPC_URL_FOR_APP }}
         with:
           host: ${{ secrets.DROPLET_HOST }}
           username: ${{ secrets.DROPLET_USERNAME }}
           password: ${{ secrets.DROPLET_PASSWORD }}
-          envs: DROPLET_PASSWORD,FIBER_SECRET_KEY_PASSWORD,FIBER_CKB_KEY,FIBER_ANNOUNCED_ADDR,FIBER_IMAGE,FIBER_IMAGE_TAG,FIBER_CONTAINER,APP_CONTAINER,FIBER_P2P_PORT,FIBER_RPC_PORT,APP_PORT,FIBER_RPC_URL_FOR_APP
+          envs: DROPLET_PASSWORD,FIBER_SECRET_KEY_PASSWORD,FIBER_LND_WALLET_PASSWORD,FIBER_CKB_KEY,FIBER_ANNOUNCED_ADDR,FIBER_IMAGE,FIBER_IMAGE_TAG,LND_IMAGE,LND_IMAGE_TAG,FIBER_CONTAINER,LND_CONTAINER,APP_CONTAINER,FIBER_P2P_PORT,FIBER_RPC_PORT,LND_P2P_PORT,APP_PORT,FIBER_RPC_URL_FOR_APP
           script: |
             set -euxo pipefail
 
             if [ -z "${FIBER_SECRET_KEY_PASSWORD:-}" ]; then
               echo "Missing secret FIBER_SECRET_KEY_PASSWORD" >&2
+              exit 1
+            fi
+
+            LND_WALLET_PASSWORD="${FIBER_LND_WALLET_PASSWORD:-$FIBER_SECRET_KEY_PASSWORD}"
+            if [ "${#LND_WALLET_PASSWORD}" -lt 8 ]; then
+              echo "LND wallet password must be at least 8 characters (set FIBER_LND_WALLET_PASSWORD or lengthen FIBER_SECRET_KEY_PASSWORD)." >&2
               exit 1
             fi
 
@@ -104,15 +134,30 @@ jobs:
             APP_DIR="${HOME}/kaze-ckb"
             ENV_FILE="${APP_DIR}/.env"
             CONFIG_FILE="${FIBER_DIR}/config.yml"
+            LND_DIR="${FIBER_DIR}/lnd"
+            LND_CONF_SRC="${FIBER_DIR}/lnd.conf"
+            LND_CONF="${LND_DIR}/lnd.conf"
+            LND_PASS_FILE="${LND_DIR}/wallet-password.txt"
             KEY_FILE="${FIBER_DIR}/ckb/key"
-            FULL_IMAGE="${FIBER_IMAGE}:${FIBER_IMAGE_TAG}"
+            MACAROON_FILE="${LND_DIR}/data/chain/bitcoin/testnet/admin.macaroon"
+            FULL_FIBER_IMAGE="${FIBER_IMAGE}:${FIBER_IMAGE_TAG}"
+            FULL_LND_IMAGE="${LND_IMAGE}:${LND_IMAGE_TAG}"
 
-            mkdir -p "${FIBER_DIR}/ckb"
+            mkdir -p "${FIBER_DIR}/ckb" "$LND_DIR"
 
             if [ ! -f "$CONFIG_FILE" ]; then
               echo "Missing Fiber config at $CONFIG_FILE (scp step failed?)" >&2
               exit 1
             fi
+            if [ ! -f "$LND_CONF_SRC" ]; then
+              echo "Missing LND config at $LND_CONF_SRC (scp step failed?)" >&2
+              exit 1
+            fi
+            cp "$LND_CONF_SRC" "$LND_CONF"
+
+            umask 077
+            printf '%s' "$LND_WALLET_PASSWORD" > "$LND_PASS_FILE"
+            chmod 600 "$LND_PASS_FILE"
 
             if [ -n "${FIBER_ANNOUNCED_ADDR:-}" ]; then
               if ! grep -qF "$FIBER_ANNOUNCED_ADDR" "$CONFIG_FILE"; then
@@ -155,16 +200,71 @@ jobs:
               ip -4 addr show docker0 || true
             fi
 
-            echo "Pulling Fiber image ${FULL_IMAGE}..."
-            sdocker pull "$FULL_IMAGE"
+            echo "Pulling images ${FULL_LND_IMAGE} and ${FULL_FIBER_IMAGE}..."
+            sdocker pull "$FULL_LND_IMAGE"
+            sdocker pull "$FULL_FIBER_IMAGE"
 
+            # ---- LND (CCH payer) ----
+            echo "Stopping old LND container..."
+            sdocker stop "$LND_CONTAINER" || true
+            sdocker rm "$LND_CONTAINER" || true
+
+            echo "Starting LND (host network; gRPC :10009, P2P :${LND_P2P_PORT})..."
+            sdocker run -d \
+              --name "$LND_CONTAINER" \
+              --restart unless-stopped \
+              --network host \
+              -v "${LND_DIR}:/root/.lnd" \
+              "$FULL_LND_IMAGE" \
+              lnd \
+              --configfile=/root/.lnd/lnd.conf
+
+            echo "Waiting for LND TLS cert..."
+            for i in $(seq 1 60); do
+              if [ -f "${LND_DIR}/tls.cert" ]; then
+                break
+              fi
+              sleep 2
+            done
+            if [ ! -f "${LND_DIR}/tls.cert" ]; then
+              echo "LND did not create tls.cert — check logs:" >&2
+              sdocker logs "$LND_CONTAINER" --tail 80 || true
+              exit 1
+            fi
+
+            # Create wallet once (non-interactive). Later boots unlock via password file.
+            if [ ! -f "$MACAROON_FILE" ]; then
+              echo "Creating LND wallet (first boot)..."
+              # lncli create prompts: password, confirm, existing seed? N, cipher passphrase (empty)
+              printf '%s\n%s\nn\n\n' "$LND_WALLET_PASSWORD" "$LND_WALLET_PASSWORD" \
+                | sdocker exec -i "$LND_CONTAINER" lncli --network=testnet create || true
+              for i in $(seq 1 90); do
+                if [ -f "$MACAROON_FILE" ]; then
+                  break
+                fi
+                sleep 2
+              done
+            fi
+
+            if [ ! -f "$MACAROON_FILE" ]; then
+              echo "WARNING: admin.macaroon missing after create attempt. Fiber CCH will start with ignore_startup_failure." >&2
+              sdocker logs "$LND_CONTAINER" --tail 100 || true
+            else
+              echo "LND macaroon ready at $MACAROON_FILE"
+              # Probe LND (may still be syncing neutrino)
+              sdocker exec "$LND_CONTAINER" lncli --network=testnet getinfo >/tmp/lnd-getinfo.json 2>/tmp/lnd-getinfo.err \
+                && cat /tmp/lnd-getinfo.json \
+                || cat /tmp/lnd-getinfo.err || true
+            fi
+
+            # ---- Fiber (with CCH) ----
             echo "Stopping old Fiber container..."
             sdocker stop "$FIBER_CONTAINER" || true
             sdocker rm "$FIBER_CONTAINER" || true
 
             # --network host: rpc binds 172.17.0.1:8227 (private, no biscuit) on the Droplet.
-            # -p is ignored with host networking; P2P 8228 and RPC 8227 are host ports.
-            echo "Starting Fiber (host network; P2P :${FIBER_P2P_PORT}, RPC ${FIBER_RPC_URL_FOR_APP})..."
+            # CCH reaches LND at https://127.0.0.1:10009 via shared host network.
+            echo "Starting Fiber (host network; P2P :${FIBER_P2P_PORT}, RPC ${FIBER_RPC_URL_FOR_APP}, CCH→LND)..."
             sdocker run -d \
               --name "$FIBER_CONTAINER" \
               --restart unless-stopped \
@@ -172,7 +272,7 @@ jobs:
               -v "${FIBER_DIR}:/fiber" \
               -e "FIBER_SECRET_KEY_PASSWORD=${FIBER_SECRET_KEY_PASSWORD}" \
               -e "RUST_LOG=info" \
-              "$FULL_IMAGE"
+              "$FULL_FIBER_IMAGE"
 
             # So deploy.yml (unchanged) picks this up via --env-file on next app deploy.
             ssudo mkdir -p "$APP_DIR"
@@ -206,16 +306,27 @@ jobs:
             echo "Containers:"
             sdocker ps -a
 
+            echo "LND logs:"
+            sdocker logs "$LND_CONTAINER" --tail 40 || true
+
             echo "Fiber logs:"
             sdocker logs "$FIBER_CONTAINER" --tail 80 || true
 
-            echo "RPC probe:"
+            echo "RPC probe (node_info):"
             curl -sS -m 5 -X POST "http://172.17.0.1:${FIBER_RPC_PORT}" \
               -H "Content-Type: application/json" \
               -d '{"jsonrpc":"2.0","id":1,"method":"node_info","params":[]}' \
               || true
             echo
 
+            echo "CCH probe (send_btc method presence — expect param error, not method-not-found):"
+            curl -sS -m 5 -X POST "http://172.17.0.1:${FIBER_RPC_PORT}" \
+              -H "Content-Type: application/json" \
+              -d '{"jsonrpc":"2.0","id":1,"method":"send_btc","params":[{}]}' \
+              || true
+            echo
+
             sdocker image prune -f
 
-            echo "Done. Fiber host-network. App uses ${FIBER_RPC_URL_FOR_APP}"
+            echo "Done. Fiber+CCH host-network. App uses ${FIBER_RPC_URL_FOR_APP}"
+            echo "Next ops (manual): fund LND with testnet BTC + open Lightning channels; fund Fiber with cWBTC channels."

@@ -1,4 +1,4 @@
-## Builder Track Weekly Report — Week 6
+## Builder Track Weekly Report — Week 7
 
 **Name:** Telesphore TUGANIMANA <br>
 **Week Ending:** 10-08-2026

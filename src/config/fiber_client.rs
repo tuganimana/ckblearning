@@ -32,6 +32,61 @@ pub fn fiber_currency() -> String {
     }
 }
 
+/// Wrapped BTC UDT type script used by Fiber CCH (1 sat = 1 UDT unit, 8 decimals).
+///
+/// Override with `FIBER_WRAPPED_BTC_TYPE_SCRIPT` (full CKB Script JSON).
+/// Testnet defaults to the cWBTC script in `deploy/fiber/config.yml`.
+pub fn wrapped_btc_type_script() -> Result<Value, (StatusCode, String)> {
+    if let Ok(raw) = env::var("FIBER_WRAPPED_BTC_TYPE_SCRIPT") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return serde_json::from_str(trimmed).map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("FIBER_WRAPPED_BTC_TYPE_SCRIPT is not valid JSON: {e}"),
+                )
+            });
+        }
+    }
+
+    match crate::config::client::network().as_str() {
+        "testnet" => Ok(serde_json::json!({
+            "code_hash": "0x25c29dc317811a6f6f3985a7a9ebc4838bd388d19d0feeecf0bcd60f6c0975bb",
+            "hash_type": "type",
+            "args": "0x9a1086531ed6dc69e0bd44cef5278e03faf3015b31aff60b08fb87663ce8507100000000"
+        })),
+        other => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "Set FIBER_WRAPPED_BTC_TYPE_SCRIPT to a CKB Script JSON for CKB_NETWORK={other} \
+                 (required for Lightning→Fiber invoice creation)."
+            ),
+        )),
+    }
+}
+
+/// Normalize a 32-byte hash to `0x` + 64 lowercase hex (Fiber `Hash256`).
+pub fn normalize_hash(value: &str) -> Result<String, (StatusCode, String)> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "payment_hash/preimage is required".to_string(),
+        ));
+    }
+    let hex = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+    if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "hash must be 32 bytes (64 hex chars), optionally 0x-prefixed".to_string(),
+        ));
+    }
+    Ok(format!("0x{}", hex.to_lowercase()))
+}
+
 /// Encode a decimal (or already-hex) integer as Fiber's `0x…` hex string.
 pub fn to_hex_u128(value: &str) -> Result<String, (StatusCode, String)> {
     let trimmed = value.trim();

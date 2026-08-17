@@ -1,4 +1,7 @@
-use axum::{routing::post, Router};
+use axum::{
+    routing::{get, post},
+    Router,
+};
 
 use crate::services::{
     balance_service, dev_send_transaction_service, dev_wallet_balance_service,
@@ -55,20 +58,35 @@ pub fn address_router() -> Router {
             post(fiber_payment_service::get_payment),
         )
         .route(
+            "/fiber/swap/fiber-to-lightning",
+            post(fiber_swap_service::fiber_to_lightning),
+        )
+        .route(
             "/fiber/swap/ckb-to-lightning",
             post(fiber_swap_service::ckb_to_lightning),
+        )
+        .route(
+            "/fiber/swap/pay-lightning",
+            post(fiber_swap_service::pay_lightning),
+        )
+        .route(
+            "/fiber/swap/receive-lightning",
+            post(fiber_swap_service::receive_lightning),
         )
         .route(
             "/fiber/swap/btc-to-ckb",
             post(fiber_swap_service::btc_to_ckb),
         )
+        .route("/fiber/swap/quote", post(fiber_swap_service::quote_swap))
+        .route("/fiber/swap/wait", post(fiber_swap_service::wait_cch_order))
+        .route("/fiber/swap/ready", get(fiber_swap_service::swap_ready))
+        .route(
+            "/fiber/swap/order/{payment_hash}",
+            get(fiber_swap_service::get_cch_order_by_path),
+        )
         .route(
             "/fiber/swap/order",
             post(fiber_swap_service::get_cch_order),
-        )
-        .route(
-            "/fiber/swap/pay-lightning",
-            post(fiber_swap_service::pay_lightning),
         )
         // -- Dev/testing-only: disabled unless ALLOW_DEV_KEY_ENDPOINTS=true --
         .route(
